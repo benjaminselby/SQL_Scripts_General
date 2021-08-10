@@ -1,20 +1,20 @@
 USE [CanvasAdmin]
 GO
 
-/****** Object:  StoredProcedure [dbo].[spLoadDailyReliefs]    Script Date: 30/11/2020 10:23:14 AM ******/
+/****** Object:  StoredProcedure [dbo].[spLoadDailyReliefs]    Script Date: 10/08/2021 11:18:19 AM ******/
 SET ANSI_NULLS ON
 GO
 
 SET QUOTED_IDENTIFIER ON
 GO
 
-
-create procedure [dbo].[spLoadDailyReliefs] (
+CREATE procedure [dbo].[spLoadDailyReliefs] (
     @inputXmlFilePath    VARCHAR(MAX)
-)
-as begin
+) AS 
 
-	/* 
+BEGIN TRY
+
+    /* 
     Daily reliefs information is created in the DailyOrganiser application, and 
     stored in a large XML file (currently ~27MB). It can take a long time to 
     query in certain cases if the queries are not constructed cleverly. 
@@ -31,16 +31,16 @@ as begin
     relief teacher table to the teacher's Woodcroft email. The email can then be used 
     to match against the Synergy Community table to obtain relief teacher ID etc. 
 
-    I don't think we need to get information for non-relief teachers, because (so far...) the 
+    I don't think we need to get information for non-relief teachers, because (hopefully...) the 
     'normal' teachers from the daily reliefs table can be matched to Synergy via their StaffId. 
     It is only the teachers in the emergency teachers table who will have unreliable codes. 
     (This is a good thing because the 'normal' teachers are stored in a different XML file.)
-	*/ 
+    */ 
 
 
-    declare @sql_loadXML NVARCHAR(MAX),
-        @XML_all AS XML, 
-        @XML_today as XML
+    declare @sql_loadXML    NVARCHAR(MAX)
+    declare @XML_all        XML
+    declare @XML_today      XML
 
 
     /* ==================================================================== */
@@ -91,9 +91,9 @@ as begin
 
 
     /* The XML data for this needs to be queried in a specific manner or
-    it will take ~26 minutes to run. The following method only takes a few seconds. */
+    it will take ~26 minutes to run. */
 
-    /* 1. Use the QUERY XML function to select a sub-branch of the main XML file 
+    /* Use the QUERY XML function to select a sub-branch of the main XML file 
     which contains all data for today only. */ 
 
     ;WITH XMLNAMESPACES (DEFAULT 'http://www.timetabling.com.au/DOV9')
@@ -103,7 +103,7 @@ as begin
     where DO.Date.query('DateString').value('.', 'VARCHAR(20)') = FORMAT(GETDATE(), 'd/MM/yyyy')
 
 
-    /* 2. Now shred the sub-branch XML to obtain all reliefs for today. */ 
+    /* Now shred the sub-branch XML to obtain all reliefs for today. */ 
 
     IF OBJECT_ID('tempdb.dbo.##DailyOrganiserReliefs') is not NULL 
         DROP TABLE ##DailyOrganiserReliefs
@@ -111,19 +111,49 @@ as begin
     ;WITH XMLNAMESPACES (DEFAULT 'http://www.timetabling.com.au/DOV9')
     select distinct 
         Day.Replacement.query('PeriodCode').value('.', 'VARCHAR(100)') AS Period,
-        Day.Replacement.query('ClassCode').value('.', 'VARCHAR(100)') AS ClassCode,
+        -- Synergy truncates long class codes to only 15 characters, so we need to match that. 
+        SUBSTRING(Day.Replacement.query('ClassCode').value('.', 'VARCHAR(100)'), 1, 15) AS ClassCode,    
         Day.Replacement.query('ReferenceTeacherCode').value('.', 'VARCHAR(20)') AS AbsentTeacherCode,
         Day.Replacement.query('ReplacementTeacherCode').value('.', 'VARCHAR(20)') AS ReliefTeacherCode
     INTO ##DailyOrganiserReliefs
     from @xml_today.nodes('Date/PeriodReplacements/PeriodReplacement') as Day(Replacement)
+
+
+    /* [2021.06.16 SELBY_B]
+
+    We've recently started seeing problems where reliefs are being saved to the 
+    Daily Organiser XML file where there are no actual classes for that relief on 
+    the corresponding day. What we do here is to DELETE any entries from today's 
+    Daily Organiser relief classes if we cannot find a match in the Synergy timetable 
+    for a given Class Code on the current day at a matching period. This seems to clear 
+    up the vast majority of erroneous records. */
+
+    DELETE DOR
+    FROM ##DailyOrganiserReliefs as DOR
+    left join Synergy.Synergetic_AUSA_WOODCROFT_PRD.dbo.Timetable as TT
+        on TT.FileYear = datepart(year, getdate())
+        and TT.FileSemester = case when datepart(month, getdate()) <= 6 then 1 else 2 end
+        and TT.DayNumber = datepart(weekday, getdate()) - 1
+        and DOR.ClassCode = TT.ClassCode 
+        /* Tutor Group period is marked as 'TG' in the Daily Organiser data, but 
+        it is Period 1 in Synergy. All other periods are offset by -1 as a result. */
+        and DOR.Period = case   
+            when TT.PeriodNumber = 1 then 'TG'
+            else CAST(TT.PeriodNumber - 1 as VARCHAR(2)) end
+    WHERE TT.ClassCode is NULL
+        
+
+    /* ====================================================================== */
+    /* ATTACH STAFF INFORMATION. */
+    /* ====================================================================== */
 
     
     /* If the replacement teacher ID cannot be obtained from the STAFF table 
     in Synergy, use the teacher's email address to obtain it from the COMMUNITY 
     table. */
 
-    IF OBJECT_ID('tempdb.dbo.##DailyReliefs') is not NULL 
-        DROP TABLE ##DailyReliefs
+    IF OBJECT_ID('tempdb.dbo.##StaffInformation') is not NULL 
+        DROP TABLE ##StaffInformation
     
     select 
         DOR.*,
@@ -135,32 +165,88 @@ as begin
             + ISNULL(COM_REL.Surname, COM_REL_ET.Surname) as ReliefTeacherName,
         ISNULL(COM_REL.OccupEmail, COM_REL_ET.OccupEmail) as ReliefTeacherEmail 
 
-    into ##DailyReliefs
+    into ##StaffInformation
     from ##DailyOrganiserReliefs as DOR
 
     -- Absent teacher. 
-    left join <SYNERGY_DB>.dbo.Staff as STF_ABSNT
+    left join Synergy.Synergetic_AUSA_WOODCROFT_PRD.dbo.Staff as STF_ABSNT
         on DOR.AbsentTeacherCode = STF_ABSNT.SchoolStaffCode 
         and STF_ABSNT.ActiveFlag = 1
-    left join <SYNERGY_DB>.dbo.Community as COM_ABSNT
+    left join Synergy.Synergetic_AUSA_WOODCROFT_PRD.dbo.Community as COM_ABSNT
         on STF_ABSNT.ID = COM_ABSNT.ID
 
     -- Relief: Ordinary Staff
-    left join <SYNERGY_DB>.dbo.Staff as STF_REL
+    left join Synergy.Synergetic_AUSA_WOODCROFT_PRD.dbo.Staff as STF_REL
         on DOR.ReliefTeacherCode = STF_REL.SchoolStaffCode 
         and STF_REL.ActiveFlag = 1
-    left join <SYNERGY_DB>.dbo.Community as COM_REL
+    left join Synergy.Synergetic_AUSA_WOODCROFT_PRD.dbo.Community as COM_REL
         on STF_REL.ID = COM_REL.ID 
 
     -- Relief: Emergency Teachers Table
     left join ##EmergencyTeachers as ET
         on DOR.ReliefTeacherCode = ET.Code
         and ET.Email like '%@woodcroft.sa.edu.au'
-    left join <SYNERGY_DB>.dbo.Community as COM_REL_ET
+    left join Synergy.Synergetic_AUSA_WOODCROFT_PRD.dbo.Community as COM_REL_ET
         on ET.Email = COM_REL_ET.OccupEmail 
 
     where DOR.ReliefTeacherCode <> '' 
     
+
+    /* ====================================================================== */
+    /* ADD EXTRA CLASSES FROM SYNERGY TIMETABLE. */
+    /* ====================================================================== */
+
+    /* 
+    Some staff are booked for multiple classes in Synergy, but the classes are held 
+    at the same time and location. Ordinarily, these 'Composite Classes' can have 
+    the same relief member assigned to both. However, sometimes multiple classes are 
+    scheduled for the same staff member but are NOT listed as Composite Classes in Timetabler. 
+    These extra classes will not appear in the Reliefs data from Daily Organiser. 
+    We add these extra classes here from the Synergy timetable. 
+    */
+    
+    IF OBJECT_ID('tempdb.dbo.##DailyReliefs') is not NULL 
+        DROP TABLE ##DailyReliefs
+        
+    select 
+        SINF.Period, 
+        SINF.ClassCode, 
+        SINF.AbsentTeacherCode,
+        SINF.ReliefTeacherCode,
+        SINF.AbsentTeacherId,
+        SINF.AbsentTeacherName,
+        SINF.AbsentTeacherEmail,
+        SINF.ReliefTeacherID,
+        SINF.ReliefTeacherName,
+        SINF.ReliefTeacherEmail
+    into ##DailyReliefs
+    from ##StaffInformation as SINF
+
+    union
+
+    select 
+        SINF.Period, 
+        TT.ClassCode, -- Composite class code, 
+        SINF.AbsentTeacherCode,
+        SINF.ReliefTeacherCode,
+        SINF.AbsentTeacherId,
+        SINF.AbsentTeacherName,
+        SINF.AbsentTeacherEmail,
+        SINF.ReliefTeacherID,
+        SINF.ReliefTeacherName,
+        SINF.ReliefTeacherEmail
+    from ##StaffInformation as SINF
+    inner join Synergy.Synergetic_AUSA_WOODCROFT_PRD.dbo.Timetable as TT
+    on
+        TT.FileYear = DATEPART(YEAR, GETDATE())
+        AND TT.FileSemester = CASE WHEN DATEPART(MONTH, GETDATE()) <= 6 THEN 1 ELSE 2 END
+        AND TT.DayNumber = DATEPART(WEEKDAY, GETDATE()) - 1
+        and SINF.Period = case   
+            when TT.PeriodNumber = 1 then 'TG'
+            else CAST(TT.PeriodNumber - 1 as VARCHAR(2)) end
+        and SINF.AbsentTeacherId = TT.StaffId
+        and SINF.ClassCode <> TT.ClassCode
+
     
     /* ==================================================================================================== */
     /* Get list of Canvas course IDs. */ 
@@ -186,7 +272,7 @@ as begin
     insert into ##CanvasCourseIds(
         ClassCode, 
         CanvasCourseId)
-    EXEC <SYNERGY_DB>..sp_executesql @Sql_executeRemoteFunc
+    EXEC Synergy.Synergetic_AUSA_WOODCROFT_PRD..sp_executesql @Sql_executeRemoteFunc
     
 
     /* ==================================================================================================== */
@@ -195,6 +281,7 @@ as begin
 
 
     insert into dbo.DailyReliefs (
+        ReliefDate,
         Period, 
         ClassCode,
         CanvasCourseId,
@@ -208,6 +295,7 @@ as begin
         ReliefTeacherEmail,
         DateModified)
     select 
+        CAST(GETDATE() AS DATE),
         DR.Period, 
         DR.ClassCode,
         CCID.CanvasCourseId,
@@ -223,6 +311,9 @@ as begin
     from ##DailyReliefs as DR
     left join ##CanvasCourseIds as CCID
         on DR.ClassCode = CCID.ClassCode collate Latin1_General_CI_AI
+    where DR.ReliefTeacherID is not NULL 
+        and DR.ReliefTeacherEmail is not NULL
+        and DR.ReliefTeacherName is not NULL
 
 
     /* ==================================================================================================== */
@@ -232,7 +323,7 @@ as begin
 
     DELETE FROM 
         dbo.DailyReliefs
-    WHERE DATEDIFF(Day, DateModified, GETDATE()) >= 365
+    WHERE DATEDIFF(Day, ReliefDate, GETDATE()) >= 365
 
 
     /* ==================================================================================================== */
@@ -241,7 +332,29 @@ as begin
 
     EXEC dbo.spiUpdateDailyReliefsEmailLog
 
-END
+    select 0 as Error
+    return
+
+
+END TRY
+BEGIN CATCH
+
+    INSERT INTO dbo.ErrorLog
+    VALUES
+        (SUSER_SNAME(),
+        ERROR_NUMBER(),
+        ERROR_STATE(),
+        ERROR_SEVERITY(),
+        ERROR_LINE(),
+        ERROR_PROCEDURE(),
+        ERROR_MESSAGE(),
+        GETDATE());
+
+    select 1 as Error
+    return
+
+END CATCH
+
 
 GO
 
