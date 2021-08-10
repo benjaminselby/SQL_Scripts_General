@@ -193,7 +193,7 @@ BEGIN TRY
     
 
     /* ====================================================================== */
-    /* ADD EXTRA CLASSES FROM SYNERGY TIMETABLE. */
+    /* ADD SIMULTANEOUS CLASSES FROM SYNERGY TIMETABLE. */
     /* ====================================================================== */
 
     /* 
