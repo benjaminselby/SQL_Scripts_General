@@ -1,0 +1,269 @@
+USE [Synergetic_AUSA_WOODCROFT_PRD]
+GO
+
+/****** Object:  View [woodcroft].[uvCourierContactInfoGrouped]    Script Date: 14/09/2021 8:31:20 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+CREATE VIEW [woodcroft].[uvCourierContactInfoGrouped] AS 
+
+    WITH BaseContactInfo AS (
+        SELECT DISTINCT
+
+            /* =================== HOUSEHOLDER INFO =================== */
+
+            COM.ID              AS PrimaryID, 
+            COM.MailSalutationJoint, 
+            COM.MailSalutationPrimary, 
+            COM.Title           AS PrimaryTitle,
+            COM.Preferred       AS PrimaryPreferred, 
+            COM.Surname         AS PrimarySurname, 
+            COM.Gender          AS PrimaryGender,
+
+            CASE WHEN COM.DefaultEmailCode = 'B' AND COM.OccupEmail <> '' AND COM.Email <> '' 
+                    -- only insert semicolon if both email addresses exist
+                    THEN COM.OccupEmail + ';' + COM.Email 
+                WHEN COM.DefaultEmailCode = 'B' 
+                    THEN COM.OccupEmail + COM.Email
+                WHEN COM.DefaultEmailCode = 'O' 
+                    THEN COM.OccupEmail
+                ELSE 
+                    COM.Email
+            END as PrimaryDefaultEmail,
+
+            NULLIF(COM.SpouseID, 0) AS SpouseID,
+            COM_SPOUSE.Title        AS SpouseTitle,
+            COM_SPOUSE.Preferred    AS SpousePreferred, 
+            COM_SPOUSE.Surname      AS SpouseSurname,
+            COM_SPOUSE.Gender       AS SpouseGender,
+            
+            CASE WHEN COM_SPOUSE.DefaultEmailCode = 'B' AND COM_SPOUSE.OccupEmail <> '' AND COM_SPOUSE.Email <> '' 
+                    -- only insert semicolon if both email addresses exist
+                    THEN COM_SPOUSE.OccupEmail + ';' + COM_SPOUSE.Email 
+                WHEN COM_SPOUSE.DefaultEmailCode = 'B' 
+                    THEN COM_SPOUSE.OccupEmail + COM_SPOUSE.Email
+                WHEN COM_SPOUSE.DefaultEmailCode = 'O' 
+                    THEN COM_SPOUSE.OccupEmail
+                ELSE 
+                    COM_SPOUSE.Email
+            END as SpouseDefaultEmail,
+
+            ADDR.AddressID, 
+
+            -- [2021.02.04] User requested address info in separate columns. 
+            --CASE 
+            --    WHEN RTRIM(LTRIM(ADDR.AddressComma)) IN ('', 'Silent Address', 'SA')
+            --        THEN '* Address Unknown *'
+            --    ELSE 
+            --        RTRIM(LTRIM(ADDR.AddressComma))
+            --END AS Address, 
+            ADDR.Address1,
+            ADDR.Address2,
+            ADDR.Address3, 
+            LTRIM(RTRIM(ADDR.Suburb + ' ' + ADDR.State + ' ' + ADDR.PostCode)) as SuburbStatePostCode,
+            
+            CASE WHEN ADDR.AddressComma IN ('', '* Address Unknown *') THEN 'Unknown'
+                WHEN ADDR.CountryCode = '' THEN 'Australia'
+                ELSE luCTRY.Description 
+            END AS AddrCountry,
+
+            /* =================== CONSTITUENCIES =================== */
+
+            CASE WHEN PRM_CUR_PRNT.ConstitCode IS NOT NULL THEN 1
+                ELSE 0
+            END AS PrimaryIsCurrentParent, 
+
+            CASE WHEN SPO_CUR_PRNT.ConstitCode IS NOT NULL THEN 1
+                ELSE 0
+            END AS SpouseIsCurrentParent,
+
+            CASE WHEN PRM_OLD_SCHLR.ConstitCode IS NOT NULL THEN 1
+                ELSE 0
+            END AS PrimaryIsOldScholar,
+
+            CASE WHEN SPO_OLD_SCHLR.ConstitCode IS NOT NULL THEN 1
+                ELSE 0
+            END AS SpouseIsOldScholar,
+
+            CASE WHEN PRM_FUT_PRNT.ConstitCode IS NOT NULL THEN 1
+                ELSE 0
+            END AS PrimaryIsFutureParent,
+
+            CASE WHEN SPO_FUT_PRNT.ConstitCode IS NOT NULL THEN 1
+                ELSE 0
+            END AS SpouseIsFutureParent,
+
+            /* =================== OLD SCHOLAR INFO =================== */
+
+            PRM_PAST_STD.EntryYearLevel             AS PrimaryOSEntryYearLevel,
+            CAST(PRM_PAST_STD.EntryDate AS DATE)    AS PrimaryOSEntryDate,
+            SPO_PAST_STD.EntryYearLevel             AS SpouseOSEntryYearLevel,
+            CAST(SPO_PAST_STD.EntryDate AS DATE)    AS SpouseOSEntryDate,
+
+
+            PRM_PAST_STD.LastYearLevel              AS PrimaryOSLastYearLevel,
+            CAST(PRM_PAST_STD.LeftDate AS DATE)     AS PrimaryOSLeftDate,
+            SPO_PAST_STD.LastYearLevel              AS SpouseOSLastYearLevel,
+            CAST(SPO_PAST_STD.LeftDate AS DATE)     AS SpouseOSLeftDate,
+
+            PRM_PAST_STD.PeerYear                   AS PrimaryPeerYear,
+            SPO_PAST_STD.PeerYear                   AS SpousePeerYear,
+   
+            /* =================== CURRENT & FUTURE STUDENT INFO =================== */
+
+            STUFF((
+                SELECT ',' + CAST(SC.ID as VARCHAR(10))
+                from dbo.StudentContacts AS SC
+                LEFT JOIN dbo.Students as STD
+                    on SC.ID = STD.ID 
+                where SC.ContactType <> 'SCT'
+                    AND SC.LinkedID IN (COM.ID, COM_SPOUSE.ID)
+                for xml path('')), 
+            1, 1, '') as CurrentStudentsIDs,
+
+            CASE WHEN EXISTS(
+                    /* Is there a member of FutureStudents (Enrolled) who has a contact 
+                    which is either the primary or spouse for this record? */ 
+                    select FSC.ID
+                    FROM FutureStudentContacts as FSC
+                    LEFT JOIN FutureStudents as FS
+                        on FSC.ID = FS.ID 
+                    where FS.Status = 'ENR'
+                        and FSC.ContactType <> 'SCT'
+                        AND FSC.LinkedID IN (COM.ID, COM_SPOUSE.ID)
+                    ) THEN 1
+                ELSE 0
+            END AS FutureStudentsEnrolled,
+
+            CASE 
+                WHEN EXISTS(
+                    /* Is there a member of FutureStudents (Registered) who has a contact 
+                    which is either the primary or spouse for this record? */ 
+                    select FSC.ID
+                    FROM FutureStudentContacts as FSC
+                    LEFT JOIN FutureStudents as FS
+                        on FSC.ID = FS.ID 
+                    where FS.Status = 'REG'
+                        and FSC.ContactType <> 'SCT'
+                        AND FSC.LinkedID IN (COM.ID, COM_SPOUSE.ID)) THEN 1
+                ELSE 0
+            END AS FutureStudentsRegistered,
+
+            STUFF((
+                SELECT ',' + CAST(FSC.ID as VARCHAR(10))
+                from dbo.FutureStudentContacts AS FSC
+                LEFT JOIN FutureStudents as FS
+                    on FSC.ID = FS.ID 
+                where FS.Status = 'ENR'
+                    AND FSC.ContactType <> 'SCT'
+                    AND FSC.LinkedID IN (COM.ID, COM_SPOUSE.ID)
+                for xml path('')), 
+            1, 1, '') as FutureStudentsEnrolledIDs,
+
+            STUFF((
+                SELECT ',' + CAST(FSC.ID as VARCHAR(10))
+                from dbo.FutureStudentContacts AS FSC
+                LEFT JOIN FutureStudents as FS
+                    on FSC.ID = FS.ID 
+                where FS.Status = 'REG'
+                    AND FSC.ContactType <> 'SCT'
+                    AND FSC.LinkedID IN (COM.ID, COM_SPOUSE.ID)
+                for xml path('')), 
+            1, 1, '') as FutureStudentsRegisteredIDs
+
+        FROM
+
+        /* ================================ FAMILY DETAILS ================================ */
+
+            /* COM = Primary household contact, usually the father. */ 
+            Community as COM
+        LEFT JOIN Community as COM_SPOUSE
+            ON COM.SpouseID = COM_SPOUSE.ID
+            /* Spouse ID flag is set where the record is a spouse to a primary householder. */
+            AND COM_SPOUSE.SpouseFlag = 1
+        LEFT JOIN Addresses as ADDR
+            on COM.AddressID = ADDR.AddressID
+
+        /* ================================ CONSTITUENCIES ================================ */
+
+        LEFT JOIN Constituencies as PRM_CUR_PRNT
+            on COM.ID = PRM_CUR_PRNT.ID
+            and PRM_CUR_PRNT.ConstitCode in ('@PC', 'PC')
+        LEFT JOIN Constituencies as SPO_CUR_PRNT
+            ON COM_SPOUSE.ID = SPO_CUR_PRNT.ID
+            and SPO_CUR_PRNT.ConstitCode in ('@PC', 'PC')
+        LEFT JOIN Constituencies as PRM_OLD_SCHLR
+            on COM.ID = PRM_OLD_SCHLR.ID
+            and PRM_OLD_SCHLR.ConstitCode = 'OS'
+        LEFT JOIN Constituencies as SPO_OLD_SCHLR
+            on COM_SPOUSE.ID = SPO_OLD_SCHLR.ID
+            and SPO_OLD_SCHLR.ConstitCode = 'OS'
+        LEFT JOIN Constituencies as PRM_FUT_PRNT
+            on COM.ID = PRM_FUT_PRNT.ID
+            and PRM_FUT_PRNT.ConstitCode = '@PF'
+        LEFT JOIN Constituencies as SPO_FUT_PRNT
+            on COM_SPOUSE.ID = SPO_FUT_PRNT.ID
+            and SPO_FUT_PRNT.ConstitCode = '@PF'
+
+        /* ================================ OLD SCHOLARS INFO ================================ */
+
+        LEFT JOIN dbo.PastStudents as PRM_PAST_STD
+            ON COM.ID = PRM_PAST_STD.ID
+        LEFT JOIN dbo.PastStudents as SPO_PAST_STD
+            ON COM_SPOUSE.ID = SPO_PAST_STD.ID 
+
+        /* ================================ LOOKUPS ================================ */
+
+        LEFT JOIN dbo.luCountry as luCTRY
+            ON ADDR.CountryCode = luCTRY.Code
+
+        /* ========================================================================= */
+
+        WHERE COM.ID > 0 
+            /* Primary householders have spouse flag not set. */ 
+            AND COM.SpouseFlag <> 1
+            AND ADDR.AddressComma not in ('* Deceased *', '* Address Unknown *', 
+                '', 'Silent Address', 'SA')
+    ),
+
+
+    GroupedContactInfo AS (
+    SELECT 
+        *,
+        CASE 
+            /* Current Parent & Old Scholar. */
+            WHEN (PrimaryIsCurrentParent = 1 AND PrimaryIsOldScholar = 1 AND PrimaryOSLastYearLevel >= 9)
+                OR (SpouseIsOldScholar = 1 AND SpouseIsCurrentParent = 1 AND SpouseOSLastYearLevel >= 9)
+                THEN 'CPOS' 
+            /* Current Parent. */ 
+            WHEN (PrimaryIsCurrentParent = 1 OR SpouseIsCurrentParent = 1) 
+                THEN 'CP'       
+            /* Future Parent Old Scholar. */
+            WHEN (PrimaryIsFutureParent = 1 AND PrimaryIsOldScholar = 1 AND PrimaryOSLastYearLevel >= 9)
+                OR (SpouseIsOldScholar = 1 AND SpouseIsFutureParent = 1 AND SpouseOSLastYearLevel >= 9)
+                THEN 'FPOS'     
+            /* Future Parent with student(s) enrolled. */ 
+            WHEN FutureStudentsEnrolled = 1     
+                THEN 'FPENR'
+            /* Future Parent with student(s) registered. */ 
+            WHEN FutureStudentsRegistered = 1   
+                THEN 'FPREG'
+            /* Old Scholar. */ 
+            WHEN (PrimaryIsOldScholar = 1 AND PrimaryOSLastYearLevel >= 9)
+                OR (SpouseIsOldScholar = 1 AND SpouseOSLastYearLevel >= 9) 
+                THEN 'OS'
+        END AS GroupCode
+    FROM BaseContactInfo WITH (NOLOCK))
+
+    SELECT * 
+    FROM GroupedContactInfo WITH (NOLOCK)
+    WHERE GroupCode is not NULL
+GO
+
+
