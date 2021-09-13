@@ -1,0 +1,237 @@
+USE [Synergetic_AUSA_WOODCROFT_PRD]
+GO
+
+/****** Object:  View [woodcroft].[uvAllStudentAssessmentResults]    Script Date: 14/09/2021 8:27:06 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+CREATE VIEW [woodcroft].[uvAllStudentAssessmentResults] 
+WITH SCHEMABINDING
+AS (
+	select 
+		StudentYears.FileYear,
+
+		Community.ID, 
+		Community.Given1, 
+		Community.Given2, 
+        Community.Preferred,
+		Community.Surname,
+        Community.Initials,
+
+		case 
+			when StudentYears.YearLevel = 0 then 'Reception'
+			when StudentYears.YearLevel >= 1 and StudentYears.YearLevel <= 5 then 'Junior'
+			when StudentYears.YearLevel >= 6 and StudentYears.YearLevel <= 9 then 'Middle'
+			when StudentYears.YearLevel >= 10 then 'Senior'
+		end as SchoolLevel,
+
+		StudentYears.Form, 
+		StudentYears.House, 
+		StudentYears.IBFlag, 
+		StudentYears.LeavingDate, 
+		StudentYears.ReturningDate, 
+		StudentYears.Status as StudentStatus, 
+		StudentYears.Tutor as TutorGroupCode,
+		luTutor.Description as TutorGroup,
+		luTutor.TutorName, 
+		StudentYears.YearLevel as StudentYearLevel,
+
+		StudentClasses.FileType, 
+		StudentClasses.FileSemester, 
+
+        /* [2021.09.09 selby_b] If Term is not available from the ResultGroup,
+        we attempt to infer it based on the ClassStartDate. */
+        CASE
+            WHEN SubjectAssessmentAreas.ResultGroup like '$T_W%' 
+                THEN SUBSTRING(SubjectAssessmentAreas.ResultGroup, 3, 1)
+            WHEN DATEPART(MONTH, StudentClasses.StartDate) <= 3  then 1
+            WHEN DATEPART(MONTH, StudentClasses.StartDate) <= 6  then 2
+            WHEN DATEPART(MONTH, StudentClasses.StartDate) <= 9  then 3
+            WHEN DATEPART(MONTH, StudentClasses.StartDate) <= 12 then 4
+            ELSE 'N/A'
+        END AS Term,
+
+		StudentClasses.ClassCode, 
+		StudentClasses.AssessableFlag, 
+		StudentClasses.StartDate as ClassStartDate, 
+		StudentClasses.StopDate as ClassStopDate,
+
+		FileSemesters.StartDate as SemesterStartDate,
+		FileSemesters.EndDate as SemesterEndDate,	
+        FileSemesters.SystemCurrentFlag as CurrentSemesterFlag,
+
+		SubjectClasses.Description as ClassDescription, 
+		SubjectClasses.AssessmentCode, 
+		SubjectClasses.LearningAreaCode, 
+		SubjectClasses.NormalYearLevel as ClassNormalYearLevel,
+		luYearLevel.YearLevelSort as ClassNormalYearLevelSort, 
+
+		LearningAreas.Description as LearningAreaDescription, 
+	
+		uSubjectSummary.Summary as SubjectSummary,
+
+        SubjectClassStaff.StaffID,
+		CommunityTeacher.Title AS StaffTitle, 
+		CommunityTeacher.Preferred AS StaffPreferred, 
+        CommunityTeacher.Initials as StaffInitials,
+		CommunityTeacher.Surname AS StaffSurname, 
+	
+		SubjectAssessmentAreas.ResultGroup, 
+		SubjectAssessmentAreas.Heading as AssessmentAreaHeading, 
+		SubjectAssessmentAreas.AreaSeq as AssessmentAreaSeq, 
+		SubjectAssessmentAreas.ResultType, 
+
+		/* ==================================================================================== */
+		/* These columns are only populated for students being assessed under the MYP code.		*/
+		/* ==================================================================================== */
+
+		CASE 
+			WHEN SubjectClasses.AssessmentCode LIKE '$MYP%'
+	    		THEN uMYPFacultyDescriptions.MYPHeading
+			ELSE NULL 
+		END AS MYPHeading, 
+
+		CASE 
+			WHEN SubjectClasses.AssessmentCode = '$MYP'
+    			THEN uMYPCriteriaDescriptions.MYPCriteriaDesc
+			WHEN SubjectClasses.AssessmentCode = '$MYPCriteria'
+                THEN MYPCriteriaOnlyDescriptions.MYPCriteriaDesc
+			ELSE NULL 
+		END AS MYPCriteriaDesc,	
+	
+		/* ==================================================================================== */
+		/* This column is only populated for students being assessed under the DP code.			*/
+		/* ie. International Baccalaureate students.											*/
+		/* ==================================================================================== */
+
+		CASE 
+			WHEN SubjectClasses.AssessmentCode like '$DP%'
+			THEN uMYPFacultyDescriptions.MYPHeading
+			ELSE NULL 
+		END AS IBHeading, 
+
+		/* ==================================================================================== */
+		/* ==================================================================================== */
+
+		StudentAssessmentResults.Result,
+
+        /* Tutor group participation values are extracted from another table which returns 
+        multiple rows, and concatenated. This is the output of the TGP ASP.NET web application. */
+        case when StudentYears.YearLevel in (7, 8, 9, 10, 11, 12)
+            and SubjectClasses.LearningAreaCode = 'TG' 
+            then 
+                
+                STUFF(
+                    (select ', ' + Activity
+                    from woodcroft.uTutorGroupParticipation as TGP
+                    LEFT JOIN woodcroft.uTutorGroupActivities as TGA
+                        on TGP.FileYear = TGA.FileYear
+                            and TGP.ActivitySeq = TGA.Seq
+                    WHERE TGP.FileYear = StudentYears.FileYear 
+                        AND StudentYears.ID = TGP.Id
+                    FOR XML PATH('')),
+                1, 2, '') + '.'
+                
+            else 
+        		StudentAssessmentComments.Comment 
+        end as AssessmentComment
+
+	from dbo.StudentYears
+	LEFT JOIN dbo.Community
+		on StudentYears.ID = Community.ID
+	LEFT JOIN dbo.StudentClasses
+		on Community.ID = StudentClasses.ID
+        and StudentYears.FileYear = StudentClasses.FileYear		
+	LEFT JOIN dbo.SubjectClasses
+		on StudentYears.FileYear		= SubjectClasses.FileYear
+		and StudentClasses.FileSemester	= SubjectClasses.FileSemester
+		and StudentClasses.FileType		= SubjectClasses.FileType
+		and StudentClasses.ClassCode	= SubjectClasses.ClassCode
+		and StudentClasses.ClassCampus	= SubjectClasses.ClassCampus
+	LEFT JOIN dbo.uSubjectSummary 
+		ON StudentYears.FileYear			= uSubjectSummary.FileYear 
+		AND StudentClasses.FileSemester		= uSubjectSummary.FileSemester 
+		AND SubjectClasses.Description		= uSubjectSummary.ClassDescription 
+		AND 
+            -- Simplify assessment codes to enable match
+            case 
+                when SubjectClasses.AssessmentCode like '$MYP%' then '$MYP'
+                when SubjectClasses.AssessmentCode like '$SACE%' then '$SACE'
+                when SubjectClasses.AssessmentCode like '$DP%' then '$DP'
+                else SubjectClasses.AssessmentCode
+            end = uSubjectSummary.AssessmentCode 
+		AND SubjectClasses.NormalYearLevel	= uSubjectSummary.YearLevel
+	LEFT JOIN dbo.SubjectClassStaff 
+		ON StudentClasses.FileType				= SubjectClassStaff.FileType
+		AND SubjectClasses.FileYear				= SubjectClassStaff.FileYear 
+		AND SubjectClasses.FileSemester			= SubjectClassStaff.FileSemester 
+		AND StudentClasses.ClassCampus			= SubjectClassStaff.ClassCampus
+		AND SubjectClasses.ClassCode			= SubjectClassStaff.ClassCode 
+		AND SubjectClasses.SubjectClassesSeq	= SubjectClassStaff.SubjectClassesSeq 
+       	/* May be multiple staff members for each class, we are only interested in primary one. */ 
+    	AND SubjectClassStaff.StaffSeq = 1
+	LEFT JOIN dbo.Community AS CommunityTeacher
+		ON SubjectClassStaff.StaffID		= CommunityTeacher.ID 
+	LEFT JOIN dbo.LearningAreas
+		on SubjectClasses.FileType			= LearningAreas.FileType
+		and SubjectClasses.LearningAreaCode = LearningAreas.LearningAreaCode
+	LEFT JOIN dbo.SubjectAssessmentAreas
+		on StudentYears.FileYear			= SubjectAssessmentAreas.FileYear
+		and StudentClasses.FileSemester		= SubjectAssessmentAreas.FileSemester
+		and StudentClasses.FileType			= SubjectAssessmentAreas.FileType
+		and SubjectClasses.AssessmentCode	= SubjectAssessmentAreas.AssessmentCode
+		and StudentClasses.ClassCampus		= SubjectAssessmentAreas.ClassCampus
+	LEFT JOIN dbo.StudentAssessmentResults
+		on Community.id					= StudentAssessmentResults.id 
+		and StudentYears.FileYear			= StudentAssessmentResults.FileYear
+		and StudentClasses.FileSemester		= StudentAssessmentResults.FileSemester
+		and StudentClasses.FileType			= StudentAssessmentResults.FileType
+		and SubjectClasses.ClassCode		= StudentAssessmentResults.ClassCode
+		and StudentClasses.ClassCampus		= StudentAssessmentResults.ClassCampus
+		and SubjectAssessmentAreas.AreaSeq	= StudentAssessmentresults.AreaSeq
+	LEFT JOIN dbo.StudentAssessmentComments 
+		ON StudentYears.FileYear = StudentAssessmentComments.FileYear 
+		AND StudentClasses.FileSemester = StudentAssessmentComments.FileSemester 
+		AND Community.ID = StudentAssessmentComments.ID 
+		AND StudentClasses.ClassCode = StudentAssessmentComments.ClassCode 
+
+	/* ================================================================================ */
+	/* The MYP Assessment Areas require additional tables.						*/
+
+	LEFT JOIN dbo.uMYPFacultyDescriptions
+		on SubjectClasses.LearningAreaCode = uMYPFacultyDescriptions.LearningAreaCode
+	LEFT JOIN dbo.uMYPCriteriaDescriptions
+		on uMYPFacultyDescriptions.MYPHeading = uMYPCriteriaDescriptions.MYPHeading
+		and SubjectAssessmentAreas.AreaSeq - 5 = uMYPCriteriaDescriptions.CriteriaSequence
+
+    /* The $MYPCriteria assessment code has different assessment area sequence numbers. */
+	LEFT JOIN dbo.uMYPCriteriaDescriptions AS MYPCriteriaOnlyDescriptions
+		on uMYPFacultyDescriptions.MYPHeading = MYPCriteriaOnlyDescriptions.MYPHeading
+		and SubjectAssessmentAreas.AreaSeq = MYPCriteriaOnlyDescriptions.CriteriaSequence
+            
+	/* ================================================================================ */
+
+	LEFT JOIN dbo.FileSemesters 
+		ON StudentClasses.FileYear = FileSemesters.FileYear 
+		AND StudentClasses.FileSemester = FileSemesters.FileSemester 
+	LEFT JOIN dbo.luTutor
+		on StudentYears.Tutor = luTutor.Code
+	LEFT JOIN dbo.luYearLevel 
+		ON SubjectClasses.NormalYearLevel = luYearLevel.Code 
+        AND LTRIM(RTRIM(UPPER(luYearLevel.Campus))) = 'WC'
+
+	where 
+		StudentClasses.ClassCode IS NOT NULL
+		AND SubjectClasses.AssessmentCode <> ''
+)
+
+
+GO
+
+
