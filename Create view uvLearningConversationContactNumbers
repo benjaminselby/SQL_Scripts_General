@@ -1,0 +1,110 @@
+USE [Synergetic_AUSA_WOODCROFT_PRD]
+GO
+
+/****** Object:  View [woodcroft].[uvLearningConversationContactNumbers]    Script Date: 14/09/2021 8:32:57 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+CREATE view [woodcroft].[uvLearningConversationContactNumbers]
+as
+    with CallPriorities as (
+        SELECT *
+        FROM OPENROWSET (
+        BULK 'FILE_PATH.tsv',   
+        FORMATFILE = 'FORMAT_FILE_PATH.xml',
+        FIRSTROW = 2) as T
+    ) 
+
+    SELECT DISTINCT
+        CYCLE.FileYear, 
+        CYCLE.FileSemester, 
+        CYCLE.PTICycleCode,
+        SESS.SessionDate, SESS.Description, 
+        SLOT.TimeStart, 
+        STAFF.StaffID,
+        COM_STF.Preferred as StaffFname, 
+        COM_STF.Surname as StaffSurname,
+        STAFF.AvailableFlag,
+        INTERVIEW.ID AS StudentId,
+        COM_STD.Given1 AS StudentFname,
+        COM_STD.Surname as StudentSurname,
+        LEFT(SY.Tutor, CHARINDEX('_', SY.Tutor) - 1) as TutorGroup,
+        INTERVIEW.ContactID, 
+        COM_CON.Title as ContactTitle,
+        COM_CON.Preferred as ContactFname,
+        COM_CON.Surname as ContactSurname,
+        CASE WHEN INTERVIEW.ContactId IS NOT NULL AND luREL_CON.Description IS NULL THEN 'No relationship'
+            ELSE luREL_CON.Description
+        END as ContactRelationship,
+        COM_SPO.ID AS SpouseId,
+        COM_SPO.Title as SpouseTitle,
+        COM_SPO.Preferred as SpouseFname,
+        COM_SPO.Surname as SpouseSurname,
+        CASE WHEN COM_SPO.ID IS NOT NULL AND luREL_SPO.Description IS NULL THEN 'No relationship'
+            ELSE luREL_SPO.Description
+        END as SpouseRelationship,
+        ISNULL(CON_PHONE.PhoneNumber, SPO_PHONE.PhoneNumber) as PhoneNumber
+    FROM 
+    /* =============== INTERVIEW LIST =============== */
+        PTInterviewCycles AS CYCLE
+    LEFT JOIN PTInterviewSessions AS SESS
+        ON CYCLE.PTICycleCode = SESS.PTICycleCode
+    LEFT JOIN PTInterviewSessionSlots AS SLOT
+        ON SESS.PTISessionSeq = SLOT.PTISessionSeq 
+    /* Changed from LEFT to INNER JOIN in March 2021 to prevent doubling-up due to separate session for Year 6 students. */
+    INNER JOIN PTInterviewSessionSlotsStaff AS STAFF
+        ON SLOT.PTISessionSlotSeq = STAFF.PTISessionSlotSeq
+    LEFT JOIN PTInterviews AS INTERVIEW
+        ON SLOT.PTISessionSlotSeq = INTERVIEW.PTISessionSlotSeq 
+        AND STAFF.StaffID = INTERVIEW.StaffID
+    /* =============== PERSONAL INFO =============== */
+    -- Community: Student
+    LEFT JOIN Community AS COM_STD  
+        ON INTERVIEW.ID = COM_STD.ID
+    LEFT JOIN StudentYears as SY
+        ON INTERVIEW.ID = SY.ID
+        AND CYCLE.FileYear = SY.FileYear
+    -- Community: Staff
+    LEFT JOIN Community AS COM_STF  
+        ON INTERVIEW.StaffID = COM_STF.ID
+    -- Community: Primary Contact
+    LEFT JOIN Community AS COM_CON  
+        ON INTERVIEW.ContactID = COM_CON.ID
+        AND COM_CON.DeceasedFlag <> 1
+    -- Relationship: Primary Contact. 
+    left join Relationships as REL_CON  
+        on INTERVIEW.ID = REL_CON.ID        
+        and INTERVIEW.ContactID = REL_CON.RelatedID
+    left join luRelationship as luREL_CON 
+        on REL_CON.Relationship = luREL_CON.Code
+    -- Community: Primary Contact's Spouse.
+    LEFT JOIN Community AS COM_SPO  
+        ON COM_CON.SpouseID = COM_SPO.ID
+        AND COM_SPO.DeceasedFlag <> 1
+    -- Relationship: Primary Contact's Spouse. 
+    left join Relationships as REL_SPO
+        on INTERVIEW.ID = REL_SPO.ID        
+        and COM_CON.SpouseID = REL_SPO.RelatedID
+    left join luRelationship as luREL_SPO
+        on REL_SPO.Relationship = luREL_SPO.Code
+    /* =============== PHONE NUMBERS =============== */
+    -- We only select phone numbers from the input data file where PRIORITY=1. 
+    LEFT JOIN CallPriorities as CON_PHONE
+        ON INTERVIEW.ID = CON_PHONE.StudentId
+        AND COM_CON.ID = CON_PHONE.ContactID
+        -- LTRIM/RTRIM don't remove tabs so need REPLACE to handle them. 
+        AND CAST(REPLACE(LTRIM(RTRIM(CON_PHONE.CallPriority)), CHAR(9), '') AS INT) = 1
+    LEFT JOIN CallPriorities AS SPO_PHONE
+        ON INTERVIEW.ID = SPO_PHONE.StudentId
+        AND COM_SPO.ID = SPO_PHONE.ContactID
+        -- LTRIM/RTRIM don't remove tabs so need REPLACE to handle them. 
+        AND CAST(REPLACE(LTRIM(RTRIM(SPO_PHONE.CallPriority)), CHAR(9), '') AS INT)  = 1
+
+GO
+
+
