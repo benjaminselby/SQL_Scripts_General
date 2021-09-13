@@ -1,0 +1,117 @@
+USE [Synergetic_AUSA_WOODCROFT_PRD]
+GO
+
+/****** Object:  View [woodcroft].[uvCanvasParentObservers]    Script Date: 14/09/2021 8:28:06 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE VIEW [woodcroft].[uvCanvasParentObservers] 
+AS
+
+    WITH PrimaryContact AS (
+        select 
+            SY.ID as StudentId, 
+            COM_STD.Preferred as StudentFirstName,
+            COM_STD.Surname as StudentSurname,
+            COM_STD.NameExternal as StudentName,
+            SY.Status AS StudentStatus, 
+
+            SC.ContactType,
+            SC.LinkedID as ContactID, 
+            COM_CON.Title as ContactTitle,
+            COM_CON.Preferred as ContactFirstName, 
+            COM_CON.Surname as ContactSurname, 
+            COM_CON.NameExternal as ContactName, 
+
+            luREL_CON.Description AS ContactRelationship, 
+
+            CASE WHEN COM_CON.DefaultEmailCode = 'O' THEN COM_CON.OccupEmail 
+                ELSE COM_CON.Email
+            END AS ContactEmail,
+
+            CASE WHEN SY.Status = 'LEF' then 'deleted'
+                ELSE 'active'
+            END as ObserverStatus
+
+        from StudentYears as SY
+        left join StudentContacts as SC
+            on SY.ID = SC.ID
+        left join Community as COM_STD
+            on SY.ID = COM_STD.ID
+        left join Community as COM_CON
+            on SC.LinkedID = COM_CON.ID
+        left join Relationships as REL_CON
+            on SY.ID = REL_CON.ID
+            and SC.LinkedID = REL_CON.RelatedID
+        left join luRelationship as luREL_CON   
+            on REL_CON.Relationship = luREL_CON.Code
+
+        where SY.FileYear = DATEPART(YEAR, GETDATE())
+            AND SY.YearLevel >= 7
+            AND SC.ContactType <> 'SCT'
+            AND COM_CON.DeceasedFlag <> 1
+            AND SC.NormalMailFlag <> 0
+            AND REL_CON.PortalApproval = 'Y'
+    )
+
+    , ContactSpouse as (
+        select 
+            SY.ID as StudentId, 
+            COM_STD.Preferred as StudentFirstName,
+            COM_STD.Surname as StudentSurname,
+            COM_STD.NameExternal as StudentName,
+            SY.Status AS StudentStatus, 
+
+            SC.ContactType,
+            COM_SPO.ID as ContactID, 
+            COM_SPO.Title as ContactTitle,
+            COM_SPO.Preferred as ContactFirstName, 
+            COM_SPO.Surname as ContactSurname, 
+            COM_SPO.NameExternal as ContactName, 
+            luREL_SPO.Description AS ContactRelationship, 
+            CASE WHEN COM_SPO.DefaultEmailCode = 'O' THEN COM_SPO.OccupEmail 
+                ELSE COM_SPO.Email
+            END AS ContactEmail,
+
+            CASE WHEN SY.Status = 'LEF' then 'deleted'
+                ELSE 'active'
+            END as ObserverStatus
+
+        from StudentYears as SY
+        left join StudentContacts as SC
+            on SY.ID = SC.ID
+        left join Community as COM_STD
+            on SY.ID = COM_STD.ID
+        left join Community as COM_CON
+            on SC.LinkedID = COM_CON.ID
+        left join Community as COM_SPO
+            on COM_CON.SpouseID = COM_SPO.ID
+        left join Relationships as REL_SPO
+            on SY.ID = REL_SPO.ID
+            and COM_SPO.ID = REL_SPO.RelatedID
+        left join luRelationship as luREL_SPO
+            on REL_SPO.Relationship = luREL_SPO.Code
+
+        where SY.FileYear = DATEPART(YEAR, GETDATE())
+            AND SY.YearLevel >= 7
+            AND SC.ContactType <> 'SCT'
+            AND COM_SPO.DeceasedFlag <> 1
+            AND SC.NormalMailFlag <> 0
+            AND REL_SPO.PortalApproval = 'Y'
+    )
+
+    SELECT * 
+    FROM PrimaryContact
+
+    UNION 
+
+    SELECT *
+    FROM ContactSpouse
+
+GO
+
+
