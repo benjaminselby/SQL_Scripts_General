@@ -554,7 +554,7 @@ AS BEGIN
 
     /* 
     Delete all rows for any result category if there is no result in 
-    this category for this student at the most recent time point. 
+    that category for this student at the most recent time point. 
     */
 
     delete FLT
@@ -579,8 +579,7 @@ AS BEGIN
     Split the data to separate out the most recent results. 
     These will be 'predicted' using the N-1 remaining results. 
     If the predicted result and the actual result are significantly 
-    different, then this difference will be considered to be 
-    significant. 
+    different, then this difference will be flagged. 
     */
 
     if OBJECT_ID('tempdb.dbo.#PredictedResults') is not NULL 
@@ -904,6 +903,7 @@ AS BEGIN
 
 
     /* Develop confidence intervals for the prediction. */
+    
     if OBJECT_ID('tempdb.dbo.#PredictionMargins') is not NULL 
         drop table #PredictionMargins
         
@@ -1061,9 +1061,6 @@ AS BEGIN
 
     select *
     from #Flagged
-    --where ResultCategory = 'Overall'
-        --and Rho > (select AVG(Rho) from #PredInterval)
-        --and ID = 18909
     order by ID, ResultCategory, DateRank
 
       
