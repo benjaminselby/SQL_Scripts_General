@@ -102,17 +102,7 @@ HISTORY
             @MedicareNumber)
 
     END
-   
-    /* Uncomment for debugging. */
-    /*
-    insert into woodcroft.uMessageLog(Application, Key1, Key2, Message)
-    values (
-        'Synergetic',
-        'OnlineApplicationImports',
-        'Debug',
-        @UpdateSql)
-    */
-    
+
 
     /* ====================================================================== */
     /* Custom code END. */
