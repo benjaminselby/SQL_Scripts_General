@@ -1,6 +1,4 @@
-
-
-CREATE PROCEDURE woodcroft.uspsGetAcademicTrendFlags (
+ALTER PROCEDURE [woodcroft].[uspsGetAcademicTrendFlags] (
 
     /* 
     If this parameter is not supplied, results will be returned 
@@ -14,6 +12,11 @@ CREATE PROCEDURE woodcroft.uspsGetAcademicTrendFlags (
     */
     @PredictedYear      int = NULL,
     @PredictedTerm      int = NULL,
+
+    /* 
+    If set to 1, output will include additional columns. 
+    */
+    @DetailedOutput     bit = 0,
 
     /* 
     The minimum number of data points for forming a regression model for a student, 
@@ -52,7 +55,7 @@ CREATE PROCEDURE woodcroft.uspsGetAcademicTrendFlags (
 
 )    
 
-AS BEGIN
+AS BEGIN TRY
 
     /*
     AUTHOR: Benjamin Selby
@@ -79,11 +82,19 @@ AS BEGIN
         what has already been observed." 
         Source: https://en.wikipedia.org/wiki/Prediction_interval
 
+    Notes: 
+
+        - Tried using table variables but they made the script very, very slow. 
+        Replaced with temp tables (#).
+
     */
+
+    
+    SET NOCOUNT ON
+    SET FMTONLY OFF
 
 
     /* ========================================================================== */
-
 
     /* 
     Default values if parameters have not been set. 
@@ -108,9 +119,9 @@ AS BEGIN
     /* ========================================================================== */
 
 
-    if OBJECT_ID('tempdb.dbo.#CurrentStudents') is not NULL drop table #CurrentStudents
     create table #CurrentStudents (
         ID  int)
+
 
     if @StudentId IS NOT NULL
     begin 
@@ -127,9 +138,6 @@ AS BEGIN
     end    
 
 
-    
-    if OBJECT_ID('tempdb.dbo.#StudentResults') is not NULL 
-        drop table #StudentResults 
 
     create table #StudentResults (
         ID                      int,
@@ -148,10 +156,9 @@ AS BEGIN
         ResultNumeric           decimal(16,2),
         ResultCategory          varchar(200))
 
+
     insert into #StudentResults
-
     select 
-
         SAR.ID, 
         SAR.FileYear, 
         SAR.FileSemester, 
@@ -320,8 +327,6 @@ AS BEGIN
     This is important for building the models. 
     */
 
-    set nocount on
-
     declare @StudentIdCounter   int
 
     declare @YearCounter        int = @HistoryCutoffYear
@@ -331,12 +336,10 @@ AS BEGIN
     declare @TermCounter        int
 
 
-    if OBJECT_ID('tempdb.dbo.#DatePoints') is not NULL 
-        drop table #DatePoints 
-
     create table #DatePoints (
         Year        int,
         Term        int)
+
 
     while @YearCounter <= @PredictedYear
     begin 
@@ -362,8 +365,6 @@ AS BEGIN
 
     end
 
-    set nocount off
-
 
     /* 
     Add all the available result categories for each student onto the 
@@ -372,8 +373,6 @@ AS BEGIN
     missing values correctly. 
     */
 
-    if OBJECT_ID('tempdb.dbo.#CategoriesByDate') is not NULL 
-        drop table #CategoriesByDate
 
     create table #CategoriesByDate (
         ID                  int,
@@ -381,9 +380,9 @@ AS BEGIN
         Year                int,
         Term                int,
         DateRank            decimal(16,2))
+            
 
     insert into #CategoriesByDate
-
     select distinct 
         SR.ID,
         SR.ResultCategory, 
@@ -417,8 +416,6 @@ AS BEGIN
 
 
 
-    if OBJECT_ID('tempdb.dbo.#AverageResults') is not NULL 
-        drop table #AverageResults
 
     create table #AverageResults (
         ID                      int,
@@ -427,9 +424,9 @@ AS BEGIN
         StudentYearLevel        int,
         ResultCategory          varchar(200),
         AverageResult           decimal(16,2))
+
         
     insert into #AverageResults
-
     select 
         SR.ID, 
         SR.Year, 
@@ -472,8 +469,6 @@ AS BEGIN
     has the same date points, with NULL values where results are missing. 
     */
 
-    if OBJECT_ID('tempdb.dbo.#AveragesByDate') is not NULL 
-        drop table #AveragesByDate
 
     create table #AveragesByDate (
         ID                      int,
@@ -483,9 +478,9 @@ AS BEGIN
         DateRank                decimal(16,2),
         StudentYearLevel        int,
         AverageResult           decimal(16,2))
-        
-    insert into #AveragesByDate
+     
 
+    insert into #AveragesByDate
     select 
         CBD.ID,
         CBD.ResultCategory,
@@ -509,11 +504,7 @@ AS BEGIN
     the minimum number of data points within that result category
     required for building our models. 
     */
-
-
-    if OBJECT_ID('tempdb.dbo.#Filtered') is not NULL 
-        drop table #Filtered
-
+       
     create table #Filtered (
         ID                      int,
         ResultCategory          varchar(200),
@@ -523,8 +514,8 @@ AS BEGIN
         StudentYearLevel        int,
         AverageResult           decimal(16,2))
 
+    
     insert into #Filtered
-
     select 
         ABD.ID,
         ABD.ResultCategory,
@@ -554,7 +545,7 @@ AS BEGIN
 
     /* 
     Delete all rows for any result category if there is no result in 
-    that category for this student at the most recent time point. 
+    this category for this student at the most recent time point. 
     */
 
     delete FLT
@@ -579,11 +570,11 @@ AS BEGIN
     Split the data to separate out the most recent results. 
     These will be 'predicted' using the N-1 remaining results. 
     If the predicted result and the actual result are significantly 
-    different, then this difference will be flagged. 
+    different, then this difference will be considered to be 
+    significant. 
     */
 
-    if OBJECT_ID('tempdb.dbo.#PredictedResults') is not NULL 
-        drop table #PredictedResults
+    
 
     create table #PredictedResults (
         ID                      int,
@@ -593,9 +584,9 @@ AS BEGIN
         DateRank                decimal(16, 2),
         StudentYearLevel        int,
         AverageResult           decimal(16,2))
+            
 
     insert into #PredictedResults
-
     select 
         FLT.ID,
         FLT.ResultCategory,
@@ -612,11 +603,7 @@ AS BEGIN
             and FLT2.ResultCategory = FLT2.ResultCategory)
     order by ID, ResultCategory, DateRank
 
-
-               
-    if OBJECT_ID('tempdb.dbo.#RemainingResults') is not NULL 
-        drop table #RemainingResults
-
+    
     create table #RemainingResults (
         ID                      int,
         ResultCategory          varchar(200),
@@ -626,8 +613,8 @@ AS BEGIN
         StudentYearLevel        int,
         AverageResult           decimal(16,2))
 
+    
     insert into #RemainingResults
-
     select 
         FLT.ID,
         FLT.ResultCategory,
@@ -635,7 +622,7 @@ AS BEGIN
         FLT.Term,
         FLT.DateRank,
         FLT.StudentYearLevel,
-        flt.AverageResult
+        FLT.AverageResult
     from #Filtered as FLT
     where FLT.DateRank < (
         select Max(MAX_DR.DateRank)
@@ -673,11 +660,7 @@ AS BEGIN
         DateRank,
         AverageResult
     from #RemainingResults
-
-
-
-    if OBJECT_ID('tempdb.dbo.#ModelOutput') is not NULL 
-        drop table #ModelOutput
+    
 
     create table #ModelOutput (
         ID                      int,
@@ -694,8 +677,8 @@ AS BEGIN
         Beta                    decimal(16,2),
         Rho                     decimal(16,2))  
 
+    
     insert into #ModelOutput
-
     select 
         ID,
         Groups,
@@ -747,11 +730,34 @@ AS BEGIN
                                   (                 SS(X)      ) 
 
     */
-        
 
-    if OBJECT_ID('tempdb.dbo.#Predicted') is not NULL 
-        drop table #Predicted
        
+    create table #Predicted (
+        ID                      int,
+        ResultCategory          varchar(200),
+        Year                    int,
+        Term                    int,
+        DateRank                decimal(16, 2),
+        StudentYearLevel        int,
+        AverageResult           decimal(16,2),
+        N                       int,
+        MeanX                   decimal(16,2),
+        MeanY                   decimal(16,2),
+        SumX                    decimal(16,2),
+        SumY                    decimal(16,2),
+        SumX_Pow2               decimal(16,2),
+        SumY_Pow2               decimal(16,2),
+        SumXY                   decimal(16,2),
+        Alpha                   decimal(16,2),
+        Beta                    decimal(16,2),
+        Rho                     decimal(16,2),  
+        DeviationX              decimal(16,2),
+        DeviationY              decimal(16,2),
+        PredY                   decimal(16,2),
+        ResidY_Pow2             decimal(16,2))
+
+                
+    insert into #Predicted
     select
         RES.*,
         MOD.N,
@@ -770,9 +776,6 @@ AS BEGIN
         MOD.Alpha + RES.DateRank * MOD.Beta as PredY,
         POWER(RES.AverageResult - (MOD.Alpha + RES.DateRank * MOD.Beta), 2 
             ) as ResidY_Pow2    
-
-    into #Predicted
-
     from (
             /* Join most recent results back onto the results 
             we used for model building. */
@@ -803,11 +806,7 @@ AS BEGIN
         and RES.ResultCategory = MOD.ResultCategory
     order by RES.ID, RES.ResultCategory, RES.DateRank
 
-    
-    
-
-    if OBJECT_ID('tempdb.dbo.#SumSquares') is not NULL 
-        drop table #SumSquares
+        
 
     create table #SumSquares (
         ID                  int,
@@ -815,8 +814,8 @@ AS BEGIN
         SumSqDevX           decimal(16, 2),
         SumSqResid          decimal(16,2))
 
-    insert into #SumSquares
 
+    insert into #SumSquares
     select 
         PRD.ID,
         PRD.ResultCategory,
@@ -839,10 +838,6 @@ AS BEGIN
     
 
     
-
-    if OBJECT_ID('tempdb.dbo.#StdErrEstimate') is not NULL 
-        drop table #StdErrEstimate
-
     create table #StdErrEstimate (
         ID                  int,
         ResultCategory      varchar(200),
@@ -850,8 +845,8 @@ AS BEGIN
         SumSqResid          decimal(16, 2),
         StdErrEstimate      decimal(16,2))
 
-    insert into #StdErrEstimate
 
+    insert into #StdErrEstimate
     select DISTINCT
         PRD.ID,
         PRD.ResultCategory,
@@ -877,9 +872,35 @@ AS BEGIN
     at different values of X. 
     */
 
-    if OBJECT_ID('tempdb.dbo.#StdErrPrediction') is not NULL 
-        drop table #StdErrPrediction
-    
+
+    create table #StdErrPrediction (
+        ID                      int,
+        ResultCategory          varchar(200),
+        Year                    int,
+        Term                    int,
+        DateRank                decimal(16, 2),
+        StudentYearLevel        int,
+        AverageResult           decimal(16,2),
+        N                       int,
+        MeanX                   decimal(16,2),
+        MeanY                   decimal(16,2),
+        SumX                    decimal(16,2),
+        SumY                    decimal(16,2),
+        SumX_Pow2               decimal(16,2),
+        SumY_Pow2               decimal(16,2),
+        SumXY                   decimal(16,2),
+        Alpha                   decimal(16,2),
+        Beta                    decimal(16,2),
+        Rho                     decimal(16,2),  
+        DeviationX              decimal(16,2),
+        DeviationY              decimal(16,2),
+        PredY                   decimal(16,2),
+        ResidY_Pow2             decimal(16,2),
+        StdErrEstimate          decimal(16,2),
+        StdErrPrediction        decimal(16,2))       
+
+
+    insert into #StdErrPrediction    
     select 
 
         PRD.*,
@@ -888,8 +909,6 @@ AS BEGIN
             1 + 1/CAST(PRD.N AS DECIMAL(16,2)) 
                 + POWER(PRD.DateRank - PRD.MeanX, 2) / SS.SumSqDevX
         ) as StdErrPrediction
-
-    into #StdErrPrediction
 
     from #Predicted as PRD
     left join #StdErrEstimate as SE
@@ -903,17 +922,42 @@ AS BEGIN
 
 
     /* Develop confidence intervals for the prediction. */
-    
-    if OBJECT_ID('tempdb.dbo.#PredictionMargins') is not NULL 
-        drop table #PredictionMargins
-        
+
+
+    create table #PredictionMargins (
+        ID                      int,
+        ResultCategory          varchar(200),
+        Year                    int,
+        Term                    int,
+        DateRank                decimal(16, 2),
+        StudentYearLevel        int,
+        AverageResult           decimal(16,2),
+        N                       int,
+        MeanX                   decimal(16,2),
+        MeanY                   decimal(16,2),
+        SumX                    decimal(16,2),
+        SumY                    decimal(16,2),
+        SumX_Pow2               decimal(16,2),
+        SumY_Pow2               decimal(16,2),
+        SumXY                   decimal(16,2),
+        Alpha                   decimal(16,2),
+        Beta                    decimal(16,2),
+        Rho                     decimal(16,2),  
+        DeviationX              decimal(16,2),
+        DeviationY              decimal(16,2),
+        PredY                   decimal(16,2),
+        ResidY_Pow2             decimal(16,2),
+        StdErrEstimate          decimal(16,2),
+        StdErrPrediction        decimal(16,2),
+        PredIntLow              decimal(16,2),
+        PredIntHigh             decimal(16,2))      
+
+
+    insert into #PredictionMargins       
     select 
         SEP.*,
         SEP.PredY - @IntervalCriticalValue * SEP.StdErrPrediction as PredIntLow,
         SEP.PredY + @IntervalCriticalValue * SEP.StdErrPrediction as PredIntHigh
-
-    into #PredictionMargins
-
     from #StdErrPrediction as SEP
 
 
@@ -924,11 +968,15 @@ AS BEGIN
     over/under them. 
     */
 
-    if OBJECT_ID('tempdb.dbo.#BetaPercentiles') is not NULL 
-        drop table #BetaPercentiles
     
-    select distinct 
+    create table #BetaPercentiles (
+        ResultCategory      varchar(200), 
+        LowPercentile       decimal(16,2),
+        HighPercentile      decimal(16,2))
 
+
+    insert into #BetaPercentiles
+    select distinct 
         ResultCategory, 
 
         PERCENTILE_CONT(@BetaLowPercentileRank) 
@@ -940,8 +988,6 @@ AS BEGIN
             within group (order by beta asc) 
             over (partition by ResultCategory) 
             as HighPercentile
-
-    into #BetaPercentiles
     from #PredictionMargins
 
           
@@ -951,9 +997,6 @@ AS BEGIN
     /* ====================================================================================== */
 
 
-
-    if OBJECT_ID('tempdb.dbo.#Flagged') is not NULL 
-        drop table #Flagged
                
     create table #Flagged (
         ID                  int,
@@ -989,7 +1032,6 @@ AS BEGIN
     
 
     insert into #Flagged
-
     select 
         PM.ID,
         PM.ResultCategory,
@@ -1059,10 +1101,53 @@ AS BEGIN
     /* ========================================================================= */
 
 
-    select *
-    from #Flagged
-    order by ID, ResultCategory, DateRank
+    if @DetailedOutput = 0 
+    begin 
 
-      
-END
+        select 
+            ID,
+            ResultCategory,
+            Year,
+            Term,
+            DateRank,
+            StudentYearLevel,
+            AverageResult,
+            N,
+            Alpha,
+            Beta,
+            Rho,
+            StdErrPrediction,
+            PredIntLow,
+            PredIntHigh,
+            BetaLowPercentile,
+            BetaHighPercentile,
+            TrendFlag,
+            MarginFlag
+        from #Flagged
+        --where ResultCategory = 'Overall'
+            --and Rho > (select AVG(Rho) from #PredInterval)
+            --and ID = 18909
+        order by ID, ResultCategory, DateRank
 
+    end
+    else begin 
+
+        select *
+        from #Flagged
+        order by ID, ResultCategory, DateRank
+
+    end 
+
+END TRY
+
+BEGIN CATCH
+
+     SELECT 
+        ERROR_NUMBER() AS ErrorNumber,
+        ERROR_SEVERITY() AS ErrorSeverity,
+        ERROR_STATE() AS ErrorState,
+        ERROR_PROCEDURE() AS ErrorProcedure,
+        ERROR_LINE() AS ErrorLine,
+        ERROR_MESSAGE() AS ErrorMessage;
+        
+END CATCH
