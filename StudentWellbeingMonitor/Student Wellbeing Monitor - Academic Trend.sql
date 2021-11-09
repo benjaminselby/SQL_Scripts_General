@@ -43,8 +43,7 @@ ALTER PROCEDURE [woodcroft].[uspsGetAcademicTrendFlags] (
     99% interval => 2.58 
     */
     @IntervalCriticalValue decimal(16,2) = 2.58,
-
-
+    
     /*
     Used to identify students with significantly positive or negative
     trends. If the regression Beta for a student is at a value lower
@@ -86,6 +85,12 @@ AS BEGIN TRY
 
         - Tried using table variables but they made the script very, very slow. 
         Replaced with temp tables (#).
+        
+    TODO: 
+    
+        - If this is called with a single StudentID value, the trend flag will not 
+        be correct, because the student is being compared to themselves and not
+        the rest of the school. 
 
     */
 
@@ -111,7 +116,7 @@ AS BEGIN TRY
             -- Last term of previous year.
             WHEN DATEPART(MONTH, GETDATE()) <= 4  THEN 4 
             WHEN DATEPART(MONTH, GETDATE()) <= 6  THEN 1
-            WHEN DATEPART(MONTH, GETDATE()) <= 10  THEN 2
+            WHEN DATEPART(MONTH, GETDATE()) <= 9  THEN 2
             ELSE 3
         END)  
 
@@ -119,6 +124,7 @@ AS BEGIN TRY
     /* ========================================================================== */
 
 
+    if OBJECT_ID('tempdb.dbo.#CurrentStudents') is not NULL drop table #CurrentStudents
     create table #CurrentStudents (
         ID  int)
 
@@ -139,6 +145,7 @@ AS BEGIN TRY
 
 
 
+    if OBJECT_ID('tempdb.dbo.#StudentResults') is not NULL drop table #StudentResults
     create table #StudentResults (
         ID                      int,
         Year                    int,
@@ -327,6 +334,8 @@ AS BEGIN TRY
     This is important for building the models. 
     */
 
+    -- set nocount on
+
     declare @StudentIdCounter   int
 
     declare @YearCounter        int = @HistoryCutoffYear
@@ -336,6 +345,7 @@ AS BEGIN TRY
     declare @TermCounter        int
 
 
+    if OBJECT_ID('tempdb.dbo.#DatePoints') is not NULL drop table #DatePoints
     create table #DatePoints (
         Year        int,
         Term        int)
@@ -365,6 +375,8 @@ AS BEGIN TRY
 
     end
 
+    -- set nocount off
+
 
     /* 
     Add all the available result categories for each student onto the 
@@ -374,6 +386,7 @@ AS BEGIN TRY
     */
 
 
+    if OBJECT_ID('tempdb.dbo.#CategoriesByDate') is not NULL drop table #CategoriesByDate
     create table #CategoriesByDate (
         ID                  int,
         ResultCategory      varchar(200),
@@ -416,7 +429,7 @@ AS BEGIN TRY
 
 
 
-
+    if OBJECT_ID('tempdb.dbo.#AverageResults') is not NULL drop table #AverageResults
     create table #AverageResults (
         ID                      int,
         Year                    int,
@@ -470,6 +483,7 @@ AS BEGIN TRY
     */
 
 
+    if OBJECT_ID('tempdb.dbo.#AveragesByDate') is not NULL drop table #AveragesByDate
     create table #AveragesByDate (
         ID                      int,
         ResultCategory          varchar(200),
@@ -505,6 +519,7 @@ AS BEGIN TRY
     required for building our models. 
     */
        
+    if OBJECT_ID('tempdb.dbo.#Filtered') is not NULL drop table #Filtered
     create table #Filtered (
         ID                      int,
         ResultCategory          varchar(200),
@@ -576,6 +591,7 @@ AS BEGIN TRY
 
     
 
+    if OBJECT_ID('tempdb.dbo.#PredictedResults') is not NULL drop table #PredictedResults
     create table #PredictedResults (
         ID                      int,
         ResultCategory          varchar(200),
@@ -604,6 +620,8 @@ AS BEGIN TRY
     order by ID, ResultCategory, DateRank
 
     
+
+    if OBJECT_ID('tempdb.dbo.#RemainingResults') is not NULL drop table #RemainingResults
     create table #RemainingResults (
         ID                      int,
         ResultCategory          varchar(200),
@@ -662,6 +680,7 @@ AS BEGIN TRY
     from #RemainingResults
     
 
+    if OBJECT_ID('tempdb.dbo.#ModelOutput') is not NULL drop table #ModelOutput
     create table #ModelOutput (
         ID                      int,
         ResultCategory          varchar(200),
@@ -732,6 +751,7 @@ AS BEGIN TRY
     */
 
        
+    if OBJECT_ID('tempdb.dbo.#Predicted') is not NULL drop table #Predicted
     create table #Predicted (
         ID                      int,
         ResultCategory          varchar(200),
@@ -808,6 +828,7 @@ AS BEGIN TRY
 
         
 
+    if OBJECT_ID('tempdb.dbo.#SumSquares') is not NULL drop table #SumSquares
     create table #SumSquares (
         ID                  int,
         ResultCategory      varchar(200),
@@ -837,7 +858,8 @@ AS BEGIN TRY
     order by ID, ResultCategory
     
 
-    
+
+    if OBJECT_ID('tempdb.dbo.#StdErrEstimate') is not NULL drop table #StdErrEstimate
     create table #StdErrEstimate (
         ID                  int,
         ResultCategory      varchar(200),
@@ -872,7 +894,7 @@ AS BEGIN TRY
     at different values of X. 
     */
 
-
+    if OBJECT_ID('tempdb.dbo.#StdErrPrediction') is not NULL drop table #StdErrPrediction
     create table #StdErrPrediction (
         ID                      int,
         ResultCategory          varchar(200),
@@ -924,6 +946,7 @@ AS BEGIN TRY
     /* Develop confidence intervals for the prediction. */
 
 
+    if OBJECT_ID('tempdb.dbo.#PredictionMargins') is not NULL drop table #PredictionMargins
     create table #PredictionMargins (
         ID                      int,
         ResultCategory          varchar(200),
@@ -969,6 +992,7 @@ AS BEGIN TRY
     */
 
     
+    if OBJECT_ID('tempdb.dbo.#BetaPercentiles') is not NULL drop table #BetaPercentiles
     create table #BetaPercentiles (
         ResultCategory      varchar(200), 
         LowPercentile       decimal(16,2),
@@ -998,6 +1022,7 @@ AS BEGIN TRY
 
 
                
+    if OBJECT_ID('tempdb.dbo.#Flagged') is not NULL drop table #Flagged
     create table #Flagged (
         ID                  int,
         ResultCategory      varchar(200),
@@ -1064,19 +1089,30 @@ AS BEGIN TRY
         PCT.LowPercentile,
         PCT.HighPercentile,
 
-        -- Flag students whose trend is within a low or high percentile. 
-        case 
-            when PM.Beta <= PCT.LowPercentile then 'LOW'
-            when PM.Beta >= PCT.HighPercentile then 'HIGH' 
-            else NULL
-        end as TrendFlag,
+        /* Flag students whose trend is within a low or high percentile. 
+        Only flag the row containing the most recent result. */
+        CASE
+            when PM.DateRank = LAST_VALUE(PM.DateRank) over (
+                    partition by PM.ID, PM.ResultCategory 
+                    order by PM.DateRank
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)                 
+                then 
+
+
+                    case 
+                        when PM.Beta <= PCT.LowPercentile then 'LOW'
+                        when PM.Beta >= PCT.HighPercentile then 'HIGH' 
+                        else NULL
+                    end 
+            ELSE 
+                NULL
+        END as TrendFlag,
 
         /* Flag students whose most recent result is significantly lower  
         or higher than predicted. */
         case 
             -- Only flag the row containing the most recent result. 
-            when PM.DateRank = 
-                LAST_VALUE(PM.DateRank) over (
+            when PM.DateRank = LAST_VALUE(PM.DateRank) over (
                     partition by PM.ID, PM.ResultCategory 
                     order by PM.DateRank
                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)                 
@@ -1124,9 +1160,6 @@ AS BEGIN TRY
             TrendFlag,
             MarginFlag
         from #Flagged
-        --where ResultCategory = 'Overall'
-            --and Rho > (select AVG(Rho) from #PredInterval)
-            --and ID = 18909
         order by ID, ResultCategory, DateRank
 
     end
@@ -1151,3 +1184,6 @@ BEGIN CATCH
         ERROR_MESSAGE() AS ErrorMessage;
         
 END CATCH
+
+
+GO
