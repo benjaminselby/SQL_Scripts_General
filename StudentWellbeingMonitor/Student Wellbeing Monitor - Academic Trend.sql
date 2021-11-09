@@ -14,9 +14,9 @@ ALTER PROCEDURE [woodcroft].[uspsGetAcademicTrendFlags] (
     @PredictedTerm      int = NULL,
 
     /* 
-    If set to 1, output will include additional columns. 
+    If set to Y, output will include additional columns. 
     */
-    @DetailedOutput     bit = 0,
+    @DetailedOutput     varchar(1) = 'N',
 
     /* 
     The minimum number of data points for forming a regression model for a student, 
@@ -85,12 +85,6 @@ AS BEGIN TRY
 
         - Tried using table variables but they made the script very, very slow. 
         Replaced with temp tables (#).
-        
-    TODO: 
-    
-        - If this is called with a single StudentID value, the trend flag will not 
-        be correct, because the student is being compared to themselves and not
-        the rest of the school. 
 
     */
 
@@ -129,19 +123,21 @@ AS BEGIN TRY
         ID  int)
 
 
-    if @StudentId IS NOT NULL
-    begin 
-        insert into #CurrentStudents (ID)
-        VALUES (@StudentId)
-    end 
-    else begin
-        insert into #CurrentStudents
-        select distinct ID
-        from StudentYears
-        where FileYear = DATEPART(YEAR, GETDATE())
-            AND Status <> 'LEF'
-            AND YearLevel >= @StudentMinYearLevel
-    end    
+    --if @StudentId IS NOT NULL
+    --begin 
+    --    insert into #CurrentStudents (ID)
+    --    VALUES (@StudentId)
+    --end 
+    --else begin
+
+    insert into #CurrentStudents
+    select distinct ID
+    from StudentYears
+    where FileYear = DATEPART(YEAR, GETDATE())
+        AND Status <> 'LEF'
+        AND YearLevel >= @StudentMinYearLevel
+
+    --end    
 
 
 
@@ -1044,7 +1040,7 @@ AS BEGIN TRY
         Alpha               decimal(16,2),
         Beta                decimal(16,2),
         Rho                 decimal(16,2),  
-        PredY               decimal(16, 2),
+        Predicted           decimal(16, 2),
         ResidY_Pow2         decimal(16, 2),
         StdErrEstimate      decimal(16, 2),
         StdErrPrediction    decimal(16, 2),
@@ -1137,8 +1133,18 @@ AS BEGIN TRY
     /* ========================================================================= */
 
 
-    if @DetailedOutput = 0 
+    if UPPER(@DetailedOutput) = 'Y'
     begin 
+
+        select *
+        from #Flagged
+        where 
+            ID = @StudentId 
+            or @StudentId is NULL
+        order by ID, ResultCategory, DateRank
+
+    end
+    else begin 
 
         select 
             ID,
@@ -1152,6 +1158,7 @@ AS BEGIN TRY
             Alpha,
             Beta,
             Rho,
+            Predicted,
             StdErrPrediction,
             PredIntLow,
             PredIntHigh,
@@ -1160,13 +1167,9 @@ AS BEGIN TRY
             TrendFlag,
             MarginFlag
         from #Flagged
-        order by ID, ResultCategory, DateRank
-
-    end
-    else begin 
-
-        select *
-        from #Flagged
+        where 
+            ID = @StudentId 
+            or @StudentId is NULL
         order by ID, ResultCategory, DateRank
 
     end 
@@ -1184,6 +1187,3 @@ BEGIN CATCH
         ERROR_MESSAGE() AS ErrorMessage;
         
 END CATCH
-
-
-GO
