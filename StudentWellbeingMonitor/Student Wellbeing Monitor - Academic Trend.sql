@@ -1,4 +1,4 @@
-ALTER PROCEDURE [woodcroft].[uspsGetAcademicTrendFlags] (
+CREATE PROCEDURE [woodcroft].[uspsGetAcademicTrendFlags] (
 
     /* 
     If this parameter is not supplied, results will be returned 
@@ -123,6 +123,11 @@ AS BEGIN TRY
         ID  int)
 
 
+    /* Originally we extracted only grades for the relevant student, but this 
+    meant that the student's trend could not be compared to others. So, now we 
+    compute all student models and then extract a single student if required. This
+    takes much longer - if speed becomes an issue it would be feasible to re-implement
+    the original student data filter. */
     --if @StudentId IS NOT NULL
     --begin 
     --    insert into #CurrentStudents (ID)
@@ -663,14 +668,17 @@ AS BEGIN TRY
 
     DECLARE @ModelInput woodcroft.uLinearModelInputTbl
 
+    /* 
+    We create a separate model for each student and result category 
+    (ie. grade/attribute/overall result type) using their grade history as input.
+    */
+    
     insert into @ModelInput(
-        ID, 
-        Groups, 
+        ModelID, 
         X, 
         Y)
     select 
-        ID,
-        ResultCategory,
+        CAST(ID AS VARCHAR(10)) + '_' + ResultCategory,
         DateRank,
         AverageResult
     from #RemainingResults
@@ -695,8 +703,8 @@ AS BEGIN TRY
     
     insert into #ModelOutput
     select 
-        ID,
-        Groups,
+        LEFT(ModelId, CHARINDEX('_', ModelId) - 1),
+        RIGHT(ModelId, LEN(ModelId) - CHARINDEX('_', ModelId)),
         N,
         MeanX,
         MeanY,
@@ -709,7 +717,7 @@ AS BEGIN TRY
         Beta,
         Rho
     from woodcroft.utfGetLinearModel(@ModelInput)
-    order by id, Groups
+    order by ModelId
        
        
 
@@ -1085,40 +1093,27 @@ AS BEGIN TRY
         PCT.LowPercentile,
         PCT.HighPercentile,
 
-        /* Flag students whose trend is within a low or high percentile. 
-        Only flag the row containing the most recent result. */
-        CASE
-            when PM.DateRank = LAST_VALUE(PM.DateRank) over (
-                    partition by PM.ID, PM.ResultCategory 
-                    order by PM.DateRank
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)                 
-                then 
-
-
-                    case 
-                        when PM.Beta <= PCT.LowPercentile then 'LOW'
-                        when PM.Beta >= PCT.HighPercentile then 'HIGH' 
-                        else NULL
-                    end 
-            ELSE 
-                NULL
+        /* Flag trend values which are above or below a high or low percentile
+        (based on all other students' trends). */
+        case 
+            when PM.Beta <= PCT.LowPercentile then 'LOW'
+            when PM.Beta >= PCT.HighPercentile then 'HIGH' 
+            else NULL
         END as TrendFlag,
 
-        /* Flag students whose most recent result is significantly lower  
-        or higher than predicted. */
+        /* Flag results which are significantly lower or higher than predicted. 
+        We only flag the most recent result because that was not included in model building. */
         case 
-            -- Only flag the row containing the most recent result. 
             when PM.DateRank = LAST_VALUE(PM.DateRank) over (
                     partition by PM.ID, PM.ResultCategory 
                     order by PM.DateRank
                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)                 
-                then 
-                    case 
-                        when PM.AverageResult < PM.PredIntLow
-                            then 'LOW'
-                        when PM.AverageResult > PM.PredIntHigh
-                            then 'HIGH'
-                    end
+                then case 
+                    when PM.AverageResult < PM.PredIntLow
+                        then 'LOW'
+                    when PM.AverageResult > PM.PredIntHigh
+                        then 'HIGH'
+                end
             else 
                 NULL
         end as MarginFlag
