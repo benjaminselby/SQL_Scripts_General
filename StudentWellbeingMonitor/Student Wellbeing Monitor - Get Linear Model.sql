@@ -1,25 +1,10 @@
-USE [Synergetic_AUSA_WOODCROFT_PRD]
-GO
-
-/****** Object:  UserDefinedFunction [woodcroft].[utfGetLinearModel]    Script Date: 13/09/2021 2:39:40 PM ******/
-SET ANSI_NULLS ON
-GO
-
-SET QUOTED_IDENTIFIER ON
-GO
-
-
-
-
-
 CREATE FUNCTION [woodcroft].[utfGetLinearModel](
     @InputData as woodcroft.uLinearModelInputTbl    READONLY
 )
 RETURNS 
 
     @Model TABLE (
-        ID          int,
-        Groups      varchar(200),
+        ModelID     varchar(500),
         N           decimal(16, 2),
         MeanX       decimal(16, 2),
         MeanY       decimal(16, 2),
@@ -48,17 +33,16 @@ AS BEGIN
     which must already exist in the DB:
 
         CREATE TYPE woodcroft.uLinearModelInputTbl AS TABLE (
-            ID          int,
-            Groups      varchar(200),
-            X           decimal(16, 2),
-            Y           decimal(16, 2))
-    
-    One model is created for each GROUP within each ID frame. So, for 
-    a given ID, there may be multiple records across multiple groups. 
+            [ModelID]   [varchar](500) NULL,
+            [X]         [decimal](16, 2) NULL,
+            [Y]         [decimal](16, 2) NULL)
+
+    One model is created for each ModelId frame. So, for a given ModelId, there 
+    should be multiple input records which are used to build that model. 
 
     RETURN VALUES:
 
-    A table containing the model as well as key statistics
+    A table containing the models as well as key statistics
     (e.g. MeanX, SumX*Y, Alpha, Beta, etc).
                 
 
@@ -85,8 +69,7 @@ AS BEGIN
 
 
     declare @BasicStats table (
-        ID          int,
-        Groups      varchar(200),
+        ModelId     varchar(500),
         N           decimal(16, 2),
         MeanX       decimal(16, 2),
         MeanY       decimal(16, 2),
@@ -100,8 +83,7 @@ AS BEGIN
     insert into @BasicStats
     select  
 
-        ID, 
-        Groups,
+        ModelId, 
 
         CAST(COUNT(*) as DECIMAL(12, 2)) AS N,
 
@@ -119,10 +101,8 @@ AS BEGIN
     from @InputData
     where X is not NULL
         and Y is not NULL
-    group by 
-        ID, 
-        Groups
-    order by ID, Groups
+    group by ModelId
+    order by ModelId
            
 
     /* ================================================================ */
@@ -145,7 +125,7 @@ AS BEGIN
             ) AS Rho
 
     from @BasicStats as STAT
-    order by ID, Groups
+    order by ModelId
 
     return 
 
