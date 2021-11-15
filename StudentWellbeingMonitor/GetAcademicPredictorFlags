@@ -2,7 +2,8 @@
 CREATE PROCEDURE woodcroft.uspsGetAcademicPredictorFlags (
     @StudentId  INT = NULL)
 
-AS BEGIN
+as begin 
+
 
     /*    
     
@@ -21,81 +22,100 @@ AS BEGIN
 
     May modify later to only target relevant learning areas (ie. Numeracy -> Mathematics)?    
     
+    TODO: Currently this only includes students up to year 9, because the PAT and NAPLAN
+        tests aren't applied to any other years. Include students in year levels above 9. 
+
+
     */
 
 
+    /* 
+    We collect each student's most recent NAPLAN results and generate an average. 
+    */
     if OBJECT_ID('tempdb.dbo.#AvgNaplanStudent') is not NULL drop table #AvgNaplanStudent
     select 
-        SynId as ID,
-        YearLevel,
+        NAP.SynId as ID,
+        NAP.YearLevel as TestYearLevel,
         -- Ignore Domain for now.
-        AVG(ScaledScore) as AvgScore
+        AVG(CAST(NAP.ScaledScore AS decimal(16, 2))) as AvgScore
     into #AvgNaplanStudent
-    from dbo.uNAPLANv2
-    where TestYear = DATEPART(YEAR, GETDATE())
-    group by SynId, YearLevel
+    from dbo.uNAPLANv2 AS NAP
+    where NAP.TestYear = (
+        select max(NAP2.TestYear) 
+        from dbo.uNAPLANv2 as NAP2
+        WHERE NAP.SynID = NAP2.SynID)
+    group by NAP.SynId, NAP.YearLevel
 
 
-
+    /* As with NAPLAN - get most recent results and compute average. */
     if OBJECT_ID('tempdb.dbo.#AvgPatStudent') is not NULL drop table #AvgPatStudent 
     select
-        Username as ID,
-        RTRIM(LTRIM(RIGHT(TestLevel, CHARINDEX(' ', REVERSE(TestLevel)) - 1))) as YearLevel,
-        AVG(Percentile) as AvgPercentile
+        PAT.Username as ID,
+        RTRIM(LTRIM(
+            RIGHT(PAT.TestLevel, 
+                CHARINDEX(' ', REVERSE(PAT.TestLevel)) - 1)
+            )) as TestYearLevel,
+        AVG(CAST(Percentile AS DECIMAL(16, 2))) as AvgPercentile
     into #AvgPatStudent 
-    from dbo.uACER
-    WHERE DATEPART(YEAR, DateComplete) = DATEPART(YEAR, GETDATE())
+    from dbo.uACER as PAT
+    WHERE DATEPART(YEAR, PAT.DateComplete) = (
+        select MAX(DATEPART(YEAR, PAT2.DateComplete))
+        from dbo.uACER as PAT2
+        where PAT.UserName = PAT2.UserName)
     group by DATEPART(YEAR, DateComplete),
         Username, 
         RTRIM(LTRIM(RIGHT(TestLevel, CHARINDEX(' ', REVERSE(TestLevel)) - 1)))
 
 
-
+    /* We merge the PAT and NAPLAN data. Some students may not have results for 
+    one or the other. */
     if OBJECT_ID('tempdb.dbo.#AllPredictors') is not NULL drop table #AllPredictors 
     select 
         ISNULL(NAP.ID, PAT.ID) AS ID,
-        ISNULL(NAP.YearLevel, PAT.YearLevel) AS YearLevel,
+        ISNULL(NAP.TestYearLevel, PAT.TestYearLevel) AS TestYearLevel,
         NAP.AvgScore as NapScore,
         PAT.AvgPercentile as PatScore,
-        AVG(CAST(NAP.AvgScore AS DECIMAL(16, 2))) OVER (PARTITION BY NAP.YearLevel) as NapMean,
-        AVG(CAST(PAT.AvgPercentile AS DECIMAL(16, 2))) OVER (PARTITION BY PAT.YearLevel) as PatMean,
+        AVG(CAST(NAP.AvgScore AS DECIMAL(16, 2))) OVER (PARTITION BY NAP.TestYearLevel) as NapMean,
+        AVG(CAST(PAT.AvgPercentile AS DECIMAL(16, 2))) OVER (PARTITION BY PAT.TestYearLevel) as PatMean,
+        -- Squared deviations from the mean. 
         POWER(
             NAP.AvgScore - AVG(
                 CAST(NAP.AvgScore AS DECIMAL(16, 2))) 
-                OVER (PARTITION BY NAP.YearLevel)
+                OVER (PARTITION BY NAP.TestYearLevel)
             , 2) AS NapSqDev,
         POWER(
             PAT.AvgPercentile - AVG(
                 CAST(PAT.AvgPercentile AS DECIMAL(16, 2))) 
-                OVER (PARTITION BY PAT.YearLevel)
+                OVER (PARTITION BY PAT.TestYearLevel)
             , 2) AS PatSqDev
     into #AllPredictors 
     from #AvgNaplanStudent as NAP
     full join #AvgPatStudent as PAT
         on NAP.ID = PAT.ID
+            
 
-    
-
-
+    /* 
+    We are going to standardise the input predictor variables by converting them 
+    to Z-scores. So, we calculate the ordinary measures of dispersion. 
+    */
     if OBJECT_ID('tempdb.dbo.#PredictorDist') is not NULL drop table #PredictorDist 
     SELECT 
         PRED.*,    
         SQRT(
-            SUM(PRED.NapSqDev) OVER (PARTITION BY PRED.YearLevel)
+            SUM(PRED.NapSqDev) OVER (PARTITION BY PRED.TestYearLevel)
             / (
                 -- Count only records with a valid NapScore (ie. exclude NULLs).
                 select COUNT(PRED2.NapScore) 
                 from #AllPredictors as PRED2
-                WHERE PRED.YearLevel = PRED2.YearLevel)) as NapStDev,
+                WHERE PRED.TestYearLevel = PRED2.TestYearLevel)) as NapStDev,
         SQRT(
-            SUM(PRED.PatSqDev) OVER (PARTITION BY PRED.YearLevel)
+            SUM(PRED.PatSqDev) OVER (PARTITION BY PRED.TestYearLevel)
             / (            
                 select COUNT(PRED2.PatScore) 
                 from #AllPredictors as PRED2
-                WHERE PRED.YearLevel = PRED2.YearLevel)) as PatStDev
+                WHERE PRED.TestYearLevel = PRED2.TestYearLevel)) as PatStDev
     into #PredictorDist 
     FROM #AllPredictors AS PRED
-
 
 
 
@@ -106,19 +126,21 @@ AS BEGIN
         (DIST.PatScore - DIST.PatMean) / DIST.PatStDev as PatZ,
 
         /* Average the two Z scores for each student to combine them. */    
-        ISNULL((DIST.NapScore - DIST.NapMean) / DIST.NapStDev, 0) 
-        + ISNULL((DIST.PatScore - DIST.PatMean) / DIST.PatStDev, 0) 
-        / case 
-            when (DIST.NapScore - DIST.NapMean) / DIST.NapStDev IS NULL 
-                    OR (DIST.PatScore - DIST.PatMean) / DIST.PatStDev IS NULL 
+        (
+            ISNULL((DIST.NapScore - DIST.NapMean) / DIST.NapStDev, 0) 
+            + ISNULL((DIST.PatScore - DIST.PatMean) / DIST.PatStDev, 0)
+        ) / case 
+            when DIST.NapScore IS NULL or DIST.NapMean is NULL or DIST.NapStDev is NULL
+                    OR DIST.PatScore IS NULL or DIST.PatMean is NULL or DIST.PatStDev is NULL
                 THEN 1
             ELSE 2 
-        END as CombinedZ
+        END as AllPredictorsZ
 
     into #ZPredictors 
     from #PredictorDist as DIST
 
 
+    
 
     if OBJECT_ID('tempdb.dbo.#RecentGrades') is not NULL drop table #RecentGrades
     select 
@@ -227,40 +249,51 @@ AS BEGIN
 
         and SAR.AssessmentAreaHeading not in ('Exam Grade', 'Community Service Hours')
     order by SAR.ID, SAR.ClassCode, SAR.Term
-
+    
 
 
     if OBJECT_ID('tempdb.dbo.#AverageGrades') is not NULL drop table #AverageGrades
     select 
         GRD.ID,
+        GRD.StudentYearLevel,
         AVG(GRD.ResultNumeric) as AverageGrade
     into #AverageGrades 
     from #RecentGrades as GRD
-    group by GRD.ID
+    group by GRD.ID, GRD.StudentYearLevel
 
 
 
     if OBJECT_ID('tempdb.dbo.#ModelInput') is not NULL drop table #ModelInput
     SELECT 
-        PRD.*, 
-        GRD.AverageGrade,
-        CASE 
-            WHEN PRD.YearLevel IS NOT NULL
-                    AND PRD.CombinedZ IS NOT NULL
-                    AND GRD.AverageGrade IS NOT NULL
-                THEN 1
-            ELSE 0
-        END AS ValidInput
+        GRD.ID,
+        GRD.StudentYearLevel,
+        PRD.TestYearLevel,
+        PRD.NapScore,
+        PRD.NapMean,
+        PRD.NapSqDev,
+        PRD.NapZ, 
+        PRD.PatScore,
+        PRD.PatMean,
+        PRD.PatSqDev,
+        PRD.PatZ,
+        PRD.AllPredictorsZ,
+        GRD.AverageGrade
     into #ModelInput
-    FROM #ZPredictors as PRD
-    left join #AverageGrades as GRD
-        on PRD.id = GRD.ID
+    from #AverageGrades as GRD
+    left join #ZPredictors as PRD
+        on GRD.ID = PRD.ID
+    where 
+        /* Exclude any student without valid predictor/independent variables. */
+        GRD.AverageGrade is not NULL
+        and PRD.AllPredictorsZ is not NULL
     
 
 
-    /* =========================================================================== */
+    /* ================================================================================ */
+    /* ================================================================================ */
     /* GENERATE THE PREDCITIVE MODEL. */
-    /* =========================================================================== */
+    /* ================================================================================ */
+    /* ================================================================================ */
 
 
     declare @ModelInput woodcroft.uLinearModelInputTbl
@@ -272,21 +305,20 @@ AS BEGIN
         X, 
         Y)
     select 
-        YearLevel, 
-        CombinedZ, 
+        StudentYearLevel, 
+        AllPredictorsZ, 
         AverageGrade
     from #ModelInput
-    where ValidInput = 1
-        AND (
-            /* If a student has been selected for comparison, 
-            remove them from model building. */
-            @StudentId is NULL
-            or #ModelInput.ID <> @StudentId)
+    where 
+        /* If a student has been selected for comparison, 
+        remove them from model building. */
+        @StudentId is NULL
+        or #ModelInput.ID <> @StudentId
 
 
     if OBJECT_ID('tempdb.dbo.#ModelOutput') is not NULL drop table #ModelOutput
     create table #ModelOutput (
-        YearLevel               int,
+        StudentYearLevel        int,
         N                       int,
         MeanX                   decimal(16,2),
         MeanY                   decimal(16,2),
@@ -331,7 +363,6 @@ AS BEGIN
     /* ================================================================================ */
 
 
-
     if OBJECT_ID('tempdb.dbo.#Results') is not NULL drop table #Results
     select 
         INPUT.*,
@@ -344,7 +375,7 @@ AS BEGIN
     into #Results
     from #ModelInput as INPUT
     left join #ModelOutput as MODEL
-        on INPUT.YearLevel = MODEL.YearLevel
+        on INPUT.StudentYearLevel = MODEL.StudentYearLevel
 
 
 
@@ -385,21 +416,21 @@ AS BEGIN
     if OBJECT_ID('tempdb.dbo.#Predicted') is not NULL drop table #Predicted
     select
         RES.*,
-        RES.CombinedZ - RES.MeanX as DeviationX,
+        RES.AllPredictorsZ - RES.MeanX as DeviationX,
         RES.AverageGrade - RES.MeanY as DeviationY,
-        RES.Alpha + RES.CombinedZ * RES.Beta as PredY,
-        POWER(RES.AverageGrade - (RES.Alpha + RES.CombinedZ * RES.Beta), 2 
+        RES.Alpha + RES.AllPredictorsZ * RES.Beta as PredY,
+        POWER(RES.AverageGrade - (RES.Alpha + RES.AllPredictorsZ * RES.Beta), 2 
             ) as ResidY_Pow2    
     into #Predicted
     from #Results as RES
-    order by RES.YearLevel, RES.ID
+    order by RES.StudentYearLevel, RES.ID
 
 
 
 
     if OBJECT_ID('tempdb.dbo.#SumSquares') is not NULL drop table #SumSquares
     select 
-        PRD.YearLevel,
+        PRD.StudentYearLevel,
         SUM(POWER(PRD.DeviationX, 2)) AS SumSqDevX,
         SUM(PRD.ResidY_Pow2) as SumSqResid,
         SQRT(
@@ -408,16 +439,12 @@ AS BEGIN
     into #SumSquares
     from #Predicted as PRD
     where 
-        /* Exclude rows which were not used in model building. */
-        PRD.ValidInput = 1 
         /* Remove any student who we excluded from model building. */
-        AND (
-            @StudentId is NULL
-            or PRD.ID <> @StudentId)
-    group by PRD.YearLevel, PRD.N
-    order by PRD.YearLevel
+        @StudentId is NULL
+        or PRD.ID <> @StudentId
+    group by PRD.StudentYearLevel, PRD.N
+    order by PRD.StudentYearLevel
     
-
 
 
     if OBJECT_ID('tempdb.dbo.#StdErrPrediction') is not NULL drop table #StdErrPrediction
@@ -426,17 +453,17 @@ AS BEGIN
         SS.StdErrEstimate,
         SS.StdErrEstimate * SQRT( 
             1 + 1/CAST(PRD.N AS DECIMAL(16,2)) 
-                + POWER(PRD.CombinedZ - PRD.MeanX, 2) / SS.SumSqDevX
+                + POWER(PRD.AllPredictorsZ - PRD.MeanX, 2) / SS.SumSqDevX
         ) as StdErrPrediction
     into #StdErrPrediction
     from #Predicted as PRD
     left join #SumSquares as SS
-        on PRD.YearLevel = SS.YearLevel
+        on PRD.StudentYearLevel = SS.StudentYearLevel
     order by 
-        PRD.YearLevel, 
+        PRD.StudentYearLevel, 
         /* Order by CombinedZ score (ie. independent variable) to check that the 
         StdError of prediction widens as we get further away from the predictor mean. */
-        PRD.CombinedZ
+        PRD.AllPredictorsZ
 
 
 
@@ -467,6 +494,6 @@ AS BEGIN
     from #PredictionMargins as PRD
     left join Community as COM
         on PRD.ID = COM.ID  
-    order by PRD.CombinedZ
+    order by PRD.StudentYearLevel, PRD.AllPredictorsZ
 
-END
+end
