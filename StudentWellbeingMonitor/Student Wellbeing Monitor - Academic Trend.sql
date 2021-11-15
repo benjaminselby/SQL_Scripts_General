@@ -918,9 +918,6 @@ AS BEGIN TRY
     left join #SumSquares as SS
         on PRD.ID = SS.ID
         and PRD.ResultCategory = SS.ResultCategory
-    --left join #SumSquares as SS
-    --    on PRD.ID = SS.ID
-    --    and PRD.ResultCategory = SS.ResultCategory
     order by ID, ResultCategory, DateRank
 
 
