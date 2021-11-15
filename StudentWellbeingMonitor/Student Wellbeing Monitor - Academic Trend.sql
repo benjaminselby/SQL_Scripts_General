@@ -845,7 +845,10 @@ AS BEGIN TRY
         PRD.ID,
         PRD.ResultCategory,
         SUM(POWER(PRD.DeviationX, 2)) AS SumSqDevX,
-        SUM(PRD.ResidY_Pow2) as SumSqResid
+        SUM(PRD.ResidY_Pow2) as SumSqResid,
+        SQRT(
+            SUM(PRD.ResidY_Pow2) / ( PRD.N - 2 )
+        ) as StdErrEstimate
     from #Predicted as PRD
     where 
         /* Exclude rows which were not used in model building. */
@@ -857,35 +860,10 @@ AS BEGIN TRY
             where PRD.ID = MAX.ID
                 and PRD.ResultCategory = MAX.ResultCategory)
     group by 
-        ID, 
-        ResultCategory
+        PRD.ID, 
+        PRD.ResultCategory, 
+        PRD.N
     order by ID, ResultCategory
-    
-
-
-    if OBJECT_ID('tempdb.dbo.#StdErrEstimate') is not NULL drop table #StdErrEstimate
-    create table #StdErrEstimate (
-        ID                  int,
-        ResultCategory      varchar(200),
-        SumSqDevX           decimal(16, 2),
-        SumSqResid          decimal(16, 2),
-        StdErrEstimate      decimal(16,2))
-
-
-    insert into #StdErrEstimate
-    select DISTINCT
-        PRD.ID,
-        PRD.ResultCategory,
-        SS.SumSqDevX,
-        SS.SumSqResid,
-        SQRT(
-            SS.SumSqResid / ( PRD.N - 2 )
-        ) as StdErrEstimate
-    from #Predicted as PRD
-    left join #SumSquares as SS
-        on PRD.ID = SS.ID
-        and PRD.ResultCategory = SS.ResultCategory
-    order by PRD.ID, PRD.ResultCategory
     
 
    
@@ -930,19 +908,19 @@ AS BEGIN TRY
     select 
 
         PRD.*,
-        SE.StdErrEstimate,
-        SE.StdErrEstimate * SQRT( 
+        SS.StdErrEstimate,
+        SS.StdErrEstimate * SQRT( 
             1 + 1/CAST(PRD.N AS DECIMAL(16,2)) 
                 + POWER(PRD.DateRank - PRD.MeanX, 2) / SS.SumSqDevX
         ) as StdErrPrediction
 
     from #Predicted as PRD
-    left join #StdErrEstimate as SE
-        on PRD.ID = SE.ID
-        and PRD.ResultCategory = SE.ResultCategory
     left join #SumSquares as SS
         on PRD.ID = SS.ID
         and PRD.ResultCategory = SS.ResultCategory
+    --left join #SumSquares as SS
+    --    on PRD.ID = SS.ID
+    --    and PRD.ResultCategory = SS.ResultCategory
     order by ID, ResultCategory, DateRank
 
 
