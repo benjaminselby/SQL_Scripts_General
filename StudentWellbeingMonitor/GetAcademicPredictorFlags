@@ -1,0 +1,472 @@
+
+CREATE PROCEDURE woodcroft.uspsGetAcademicPredictorFlags (
+    @StudentId  INT = NULL)
+
+AS BEGIN
+
+    /*    
+    
+    AUTHOR: Benjamin Selby
+    DATE:   2021.11.15
+    
+    Uses results from ACER PAT & NAPLAN tests and existing student grades to create 
+    a linear model which predicts student grade results. Students who have actual grades 
+    significantly higher or lower than those predicted may be said to be 'exceptional'. 
+    
+    The @StudentId parameter allows a single student to be targeted. That student will not 
+    be used for model building, but their actual grades will be compared against predicted 
+    values and flagged if they are outside the expected bounds. This should increase power 
+    of the test as a student does not contribute to (and potentially bias) the model. 
+    Ideally, this routine should be run once for each student separately. 
+
+    May modify later to only target relevant learning areas (ie. Numeracy -> Mathematics)?    
+    
+    */
+
+
+    if OBJECT_ID('tempdb.dbo.#AvgNaplanStudent') is not NULL drop table #AvgNaplanStudent
+    select 
+        SynId as ID,
+        YearLevel,
+        -- Ignore Domain for now.
+        AVG(ScaledScore) as AvgScore
+    into #AvgNaplanStudent
+    from dbo.uNAPLANv2
+    where TestYear = DATEPART(YEAR, GETDATE())
+    group by SynId, YearLevel
+
+
+
+    if OBJECT_ID('tempdb.dbo.#AvgPatStudent') is not NULL drop table #AvgPatStudent 
+    select
+        Username as ID,
+        RTRIM(LTRIM(RIGHT(TestLevel, CHARINDEX(' ', REVERSE(TestLevel)) - 1))) as YearLevel,
+        AVG(Percentile) as AvgPercentile
+    into #AvgPatStudent 
+    from dbo.uACER
+    WHERE DATEPART(YEAR, DateComplete) = DATEPART(YEAR, GETDATE())
+    group by DATEPART(YEAR, DateComplete),
+        Username, 
+        RTRIM(LTRIM(RIGHT(TestLevel, CHARINDEX(' ', REVERSE(TestLevel)) - 1)))
+
+
+
+    if OBJECT_ID('tempdb.dbo.#AllPredictors') is not NULL drop table #AllPredictors 
+    select 
+        ISNULL(NAP.ID, PAT.ID) AS ID,
+        ISNULL(NAP.YearLevel, PAT.YearLevel) AS YearLevel,
+        NAP.AvgScore as NapScore,
+        PAT.AvgPercentile as PatScore,
+        AVG(CAST(NAP.AvgScore AS DECIMAL(16, 2))) OVER (PARTITION BY NAP.YearLevel) as NapMean,
+        AVG(CAST(PAT.AvgPercentile AS DECIMAL(16, 2))) OVER (PARTITION BY PAT.YearLevel) as PatMean,
+        POWER(
+            NAP.AvgScore - AVG(
+                CAST(NAP.AvgScore AS DECIMAL(16, 2))) 
+                OVER (PARTITION BY NAP.YearLevel)
+            , 2) AS NapSqDev,
+        POWER(
+            PAT.AvgPercentile - AVG(
+                CAST(PAT.AvgPercentile AS DECIMAL(16, 2))) 
+                OVER (PARTITION BY PAT.YearLevel)
+            , 2) AS PatSqDev
+    into #AllPredictors 
+    from #AvgNaplanStudent as NAP
+    full join #AvgPatStudent as PAT
+        on NAP.ID = PAT.ID
+
+    
+
+
+    if OBJECT_ID('tempdb.dbo.#PredictorDist') is not NULL drop table #PredictorDist 
+    SELECT 
+        PRED.*,    
+        SQRT(
+            SUM(PRED.NapSqDev) OVER (PARTITION BY PRED.YearLevel)
+            / (
+                -- Count only records with a valid NapScore (ie. exclude NULLs).
+                select COUNT(PRED2.NapScore) 
+                from #AllPredictors as PRED2
+                WHERE PRED.YearLevel = PRED2.YearLevel)) as NapStDev,
+        SQRT(
+            SUM(PRED.PatSqDev) OVER (PARTITION BY PRED.YearLevel)
+            / (            
+                select COUNT(PRED2.PatScore) 
+                from #AllPredictors as PRED2
+                WHERE PRED.YearLevel = PRED2.YearLevel)) as PatStDev
+    into #PredictorDist 
+    FROM #AllPredictors AS PRED
+
+
+
+
+    if OBJECT_ID('tempdb.dbo.#ZPredictors') is not NULL drop table #ZPredictors
+    select 
+        DIST.*,
+        (DIST.NapScore - DIST.NapMean) / DIST.NapStDev as NapZ,
+        (DIST.PatScore - DIST.PatMean) / DIST.PatStDev as PatZ,
+
+        /* Average the two Z scores for each student to combine them. */    
+        ISNULL((DIST.NapScore - DIST.NapMean) / DIST.NapStDev, 0) 
+        + ISNULL((DIST.PatScore - DIST.PatMean) / DIST.PatStDev, 0) 
+        / case 
+            when (DIST.NapScore - DIST.NapMean) / DIST.NapStDev IS NULL 
+                    OR (DIST.PatScore - DIST.PatMean) / DIST.PatStDev IS NULL 
+                THEN 1
+            ELSE 2 
+        END as CombinedZ
+
+    into #ZPredictors 
+    from #PredictorDist as DIST
+
+
+
+    if OBJECT_ID('tempdb.dbo.#RecentGrades') is not NULL drop table #RecentGrades
+    select 
+        SAR.ID, 
+        SAR.FileYear, 
+        SAR.FileSemester, 
+        SAR.Term,
+        SAR.StudentYearLevel,
+        SAR.ClassCode, 
+        SAR.ClassDescription, 
+        SAR.ClassNormalYearLevel, 
+        SAR.AssessmentCode,
+        SAR.AssessmentAreaSeq,
+        SAR.AssessmentAreaHeading,
+        SAR.ResultType,
+        SAR.Result, 
+
+        /* =============================================================================== */
+        /* Convert all academic results to numeric values ranging from 0-100 
+            to enable comparison. */
+        /* =============================================================================== */
+
+        CASE 
+            WHEN SAR.ResultType in ('$IBD', '$MYPCalc', '$MYPGrade') THEN 
+                CASE 
+                    WHEN SAR.Result = 1 THEN 0.0
+                    WHEN SAR.Result = 2 THEN 16.6
+                    WHEN SAR.Result = 3 THEN 33.3
+                    WHEN SAR.Result = 4 THEN 49.9
+                    WHEN SAR.Result = 5 THEN 66.5
+                    WHEN SAR.Result = 6 THEN 83.1
+                    WHEN SAR.Result = 7 THEN 100.0
+                END
+
+            WHEN SAR.ResultType = '$SACEGrade' THEN 
+                CASE 
+                    WHEN SAR.Result = 'E-'  THEN 0.0
+                    WHEN SAR.Result = 'E'   THEN 7.1
+                    WHEN SAR.Result = 'E+'  THEN 14.3
+                    WHEN SAR.Result = 'D-'  THEN 21.4
+                    WHEN SAR.Result = 'D'   THEN 28.6
+                    WHEN SAR.Result = 'D+'  THEN 35.7
+                    WHEN SAR.Result = 'C-'  THEN 42.9
+                    WHEN SAR.Result = 'C'   THEN 50.0
+                    WHEN SAR.Result = 'C+'  THEN 57.1
+                    WHEN SAR.Result = 'B-'  THEN 64.3
+                    WHEN SAR.Result = 'B'   THEN 71.4
+                    WHEN SAR.Result = 'B+'  THEN 78.6
+                    WHEN SAR.Result = 'A-'  THEN 85.7
+                    WHEN SAR.Result = 'A'   THEN 92.9
+                    WHEN SAR.Result = 'A+'  THEN 100.0
+                END
+
+            WHEN SAR.ResultType = '0-7' THEN 
+                CASE 
+                    WHEN SAR.Result = 0 THEN 0.0
+                    WHEN SAR.Result = 1 THEN 14.3
+                    WHEN SAR.Result = 2 THEN 28.6
+                    WHEN SAR.Result = 3 THEN 42.9
+                    WHEN SAR.Result = 4 THEN 57.1
+                    WHEN SAR.Result = 5 THEN 71.4
+                    WHEN SAR.Result = 6 THEN 85.7
+                    WHEN SAR.Result = 7 THEN 100.0
+                END
+
+            WHEN SAR.ResultType = 'OHCCDNYE' THEN 
+                CASE 
+                    WHEN SAR.Result = 'NYE' THEN 0.0
+                    WHEN SAR.Result = 'D'   THEN 25.0
+                    WHEN SAR.Result = 'C'   THEN 50.0
+                    WHEN SAR.Result = 'HC'  THEN 75.0
+                    WHEN SAR.Result = 'O'   THEN 100.0
+                END                
+            ELSE 
+                NULL
+
+        END as ResultNumeric
+
+    into #RecentGrades 
+    from woodcroft.uvAllStudentAssessmentResults as SAR
+    where 
+        /* If we are currently in S1 then the most recent grade will be for S2 
+        in the previous year. */
+        SAR.FileYear = DATEPART(YEAR, GETDATE()) - 
+            CASE WHEN DATEPART(MONTH, GETDATE()) <= 6 THEN 1 ELSE 0 END
+        and SAR.FileSemester = CASE WHEN DATEPART(MONTH, GETDATE()) <= 6 THEN 2 ELSE 1 END
+
+        and SAR.Result not in ('', 'NA', 'Abs', 'Not Relevant')
+        and SAR.Result is not NULL
+
+        and SAR.LearningAreaCode <> 'MT'
+        and SAR.AssessmentCode not like 'MusicTutor%'
+
+        and SAR.ResultType not in ('$Attribute', '$MYPCriteria',
+            'ServiceLearning', 'Instrument', 'MTutMain')
+        and SAR.ResultType not like 'WISE%'
+        and SAR.ResultType not like 'Reception%'
+        
+        and not (
+            SAR.ResultType = 'OHCCDNYE'
+            and SAR.Result in ('M', 'U', 'A', 'S', 'NA'))
+
+        and not (
+            SAR.ResultType = '$SACEGrade'
+            and SAR.Result in ('U', 'Abs'))
+
+        and SAR.AssessmentAreaHeading not in ('Exam Grade', 'Community Service Hours')
+    order by SAR.ID, SAR.ClassCode, SAR.Term
+
+
+
+    if OBJECT_ID('tempdb.dbo.#AverageGrades') is not NULL drop table #AverageGrades
+    select 
+        GRD.ID,
+        AVG(GRD.ResultNumeric) as AverageGrade
+    into #AverageGrades 
+    from #RecentGrades as GRD
+    group by GRD.ID
+
+
+
+    if OBJECT_ID('tempdb.dbo.#ModelInput') is not NULL drop table #ModelInput
+    SELECT 
+        PRD.*, 
+        GRD.AverageGrade,
+        CASE 
+            WHEN PRD.YearLevel IS NOT NULL
+                    AND PRD.CombinedZ IS NOT NULL
+                    AND GRD.AverageGrade IS NOT NULL
+                THEN 1
+            ELSE 0
+        END AS ValidInput
+    into #ModelInput
+    FROM #ZPredictors as PRD
+    left join #AverageGrades as GRD
+        on PRD.id = GRD.ID
+    
+
+
+    /* =========================================================================== */
+    /* GENERATE THE PREDCITIVE MODEL. */
+    /* =========================================================================== */
+
+
+    declare @ModelInput woodcroft.uLinearModelInputTbl
+
+    /* We use Year Level as ModelId so a separate model is generated 
+    for every student year level. */
+    insert into @ModelInput (
+        ModelID, 
+        X, 
+        Y)
+    select 
+        YearLevel, 
+        CombinedZ, 
+        AverageGrade
+    from #ModelInput
+    where ValidInput = 1
+        AND (
+            /* If a student has been selected for comparison, 
+            remove them from model building. */
+            @StudentId is NULL
+            or #ModelInput.ID <> @StudentId)
+
+
+    if OBJECT_ID('tempdb.dbo.#ModelOutput') is not NULL drop table #ModelOutput
+    create table #ModelOutput (
+        YearLevel               int,
+        N                       int,
+        MeanX                   decimal(16,2),
+        MeanY                   decimal(16,2),
+        SumX                    decimal(16,2),
+        SumY                    decimal(16,2),
+        SumX_Pow2               decimal(16,2),
+        SumY_Pow2               decimal(16,2),
+        SumXY                   decimal(16,2),
+        Alpha                   decimal(16,2),
+        Beta                    decimal(16,2),
+        Rho                     decimal(16,2))  
+
+  
+    insert into #ModelOutput
+    select 
+        ModelId,
+        N,
+        MeanX,
+        MeanY,
+        SumX,
+        SumY,
+        SumX_Pow2,
+        SumY_Pow2,
+        SumXY,
+        Alpha,
+        Beta,
+        Rho
+    from woodcroft.utfGetLinearModel(@ModelInput)
+    order by ModelId
+
+    /* 
+    Note from this point forward: the 'N' value indicates how many records were used 
+    to build the models, and may be less than the total number of records in a given 
+    year level. So, make sure to use N instead of COUNT(*) where appropriate. 
+    */
+
+
+    /* ================================================================================ */
+    /* ================================================================================ */
+    /* GENERATE PREDICTION INTERVALS. */
+    /* ================================================================================ */
+    /* ================================================================================ */
+
+
+
+    if OBJECT_ID('tempdb.dbo.#Results') is not NULL drop table #Results
+    select 
+        INPUT.*,
+        MODEL.MeanX,
+        MODEL.MeanY,
+        MODEL.Alpha,
+        MODEL.Beta,
+        MODEL.Rho,
+        MODEL.N
+    into #Results
+    from #ModelInput as INPUT
+    left join #ModelOutput as MODEL
+        on INPUT.YearLevel = MODEL.YearLevel
+
+
+
+    /*  
+        -----------------------------------------------------------------------------------
+        Now compute error statistics and develop confidence intervals around predicted 
+        Y values. 
+        -----------------------------------------------------------------------------------
+
+        Standard Error of the Estimate 
+        
+            =       SE(est)
+
+            =       SQRT( Mean Square Residual )
+
+                    (    ( Actual(Y) - Predicted(Y) )^2     )
+            =   SQRT( ------------------------------------- )
+                    (                 N - 2                 )
+
+
+        Sum of Squares(X) 
+    
+            =   SS(X)
+
+            =   SUM( (X' - Mean(X))^2 )
+
+
+        Standard Error of the Prediction at X'
+        (Note that this changes for different values of X')
+
+                                    (           (X' - Mean(X))^2 )
+            =       SE(est) * SQRT( 1 + 1/N + ---------------- )
+                                    (                 SS(X)      ) 
+
+    */
+
+       
+    if OBJECT_ID('tempdb.dbo.#Predicted') is not NULL drop table #Predicted
+    select
+        RES.*,
+        RES.CombinedZ - RES.MeanX as DeviationX,
+        RES.AverageGrade - RES.MeanY as DeviationY,
+        RES.Alpha + RES.CombinedZ * RES.Beta as PredY,
+        POWER(RES.AverageGrade - (RES.Alpha + RES.CombinedZ * RES.Beta), 2 
+            ) as ResidY_Pow2    
+    into #Predicted
+    from #Results as RES
+    order by RES.YearLevel, RES.ID
+
+
+
+
+    if OBJECT_ID('tempdb.dbo.#SumSquares') is not NULL drop table #SumSquares
+    select 
+        PRD.YearLevel,
+        SUM(POWER(PRD.DeviationX, 2)) AS SumSqDevX,
+        SUM(PRD.ResidY_Pow2) as SumSqResid,
+        SQRT(
+            SUM(PRD.ResidY_Pow2) / ( PRD.N - 2 )
+        ) as StdErrEstimate
+    into #SumSquares
+    from #Predicted as PRD
+    where 
+        /* Exclude rows which were not used in model building. */
+        PRD.ValidInput = 1 
+        /* Remove any student who we excluded from model building. */
+        AND (
+            @StudentId is NULL
+            or PRD.ID <> @StudentId)
+    group by PRD.YearLevel, PRD.N
+    order by PRD.YearLevel
+    
+
+
+
+    if OBJECT_ID('tempdb.dbo.#StdErrPrediction') is not NULL drop table #StdErrPrediction
+    select 
+        PRD.*,
+        SS.StdErrEstimate,
+        SS.StdErrEstimate * SQRT( 
+            1 + 1/CAST(PRD.N AS DECIMAL(16,2)) 
+                + POWER(PRD.CombinedZ - PRD.MeanX, 2) / SS.SumSqDevX
+        ) as StdErrPrediction
+    into #StdErrPrediction
+    from #Predicted as PRD
+    left join #SumSquares as SS
+        on PRD.YearLevel = SS.YearLevel
+    order by 
+        PRD.YearLevel, 
+        /* Order by CombinedZ score (ie. independent variable) to check that the 
+        StdError of prediction widens as we get further away from the predictor mean. */
+        PRD.CombinedZ
+
+
+
+    if OBJECT_ID('tempdb.dbo.#PredictionMargins') is not NULL drop table #PredictionMargins
+    select 
+        SEP.*,
+        SEP.PredY - 1.96 * SEP.StdErrPrediction as PredIntLow,
+        SEP.PredY + 1.96 * SEP.StdErrPrediction as PredIntHigh,
+    
+        /* Flag results which are significantly lower or higher than predicted. */
+        case 
+            when SEP.AverageGrade < (SEP.PredY - 1.96 * SEP.StdErrPrediction)
+                then 'LOW'
+            when SEP.AverageGrade > (SEP.PredY + 1.96 * SEP.StdErrPrediction)
+                then 'HIGH'
+            else 
+                NULL
+        end as MarginFlag
+    into #PredictionMargins
+    from #StdErrPrediction as SEP
+
+
+    select 
+        COM.NameExternal as StudentName, 
+        PRD.*,
+        case when @StudentId is NULL or PRD.ID <> @StudentId then 0 else 1 end 
+            as Excluded
+    from #PredictionMargins as PRD
+    left join Community as COM
+        on PRD.ID = COM.ID  
+    order by PRD.CombinedZ
+
+END
