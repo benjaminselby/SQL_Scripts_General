@@ -1061,9 +1061,9 @@ left join Addresses as ADDR_ADDRID
     and ADDR_ADDRID.ValidAddressFlag = 1
 where (
     @RemoveInternationalParents = 0
-    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) AS CountryCode is NULL
-    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) AS CountryCode = '' 
-    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) AS CountryCode = 'AUST')
+    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) is NULL
+    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) = '' 
+    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) = 'AUST')
 
     
 if @DebugDatasets = 1 
