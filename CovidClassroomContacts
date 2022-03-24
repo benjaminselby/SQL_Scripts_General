@@ -1,0 +1,1364 @@
+
+/* 
+This was created to generate a list of student classroom contacts so that parents could be 
+mailed out notification emails. It incorporates shared classrooms for certain day/periods, 
+student absences, bus passenger lists, and excludes students who are already isolating 
+so that they don't get redundant notifications. 
+*/
+
+
+
+/* ==================================================================================== */
+/* USER VARIABLES. */
+/* ==================================================================================== */
+
+
+/* 
+MANDATORY: 
+    -YearLevel 
+    OR 
+    -StudentId 
+    OR 
+    -StaffId 
+*/
+DECLARE @YearLevel int = NULL
+DECLARE @StaffId INT = NULL 
+DECLARE @StudentId INT = 12345 --NULL
+
+
+/* 
+MANDATORY: 
+    - ContactDate & IncludeDaysPrior 
+    OR 
+    - ContactDateList 
+*/
+DECLARE @ContactDate Date = '2022-03-23'
+DECLARE @IncludeDaysPrior int = 2
+DECLARE @ContactDateList VARCHAR(MAX) = NULL -- e.g. '2022-02-15,2022-02-16,2022-02-17'
+
+
+/* 
+Date the student tested positive on. Note this may be different to the dates 
+    that the student was at school. Also, we can't always be certain that this is correct. 
+    I am only entering the day on which I was notified, unless a test date is specified. 
+OPTIONAL: Comment regarding test. 
+*/
+DECLARE @PositiveTestDate DATE = '2022-03-23' 
+DECLARE @TestComment VARCHAR(MAX) = ''
+
+
+/* 
+MANDATORY: Number of days we expect students to be in isolation after a positive test result. 
+    This is used to determine if we should notify parents if a student has already 
+    tested covid-positive but has had another classroom contact. 
+*/
+DECLARE @IsolationDays INT = 10
+
+
+
+/* ==================================================================================== */
+/* CONTROL VARIABLES */
+/* ==================================================================================== */
+
+
+/* Use this to run section of code which adds extra manually identified students. 
+This should be modified on a per-student basis. If in doubt, set to 0. */
+DECLARE @IncludeExtraStudents BIT = 0
+
+/* Add bus passengers automatically from a data file from the BusMinder website?
+This needs to be downloaded every day and should include data for the past week or so. */
+DECLARE @AddBusPassengersAutomatically BIT = 1
+
+/* Include extra classes and periods e.g. when classes have been combined in 
+a way which has not been timetabled. */
+DECLARE @AddExtraClassPeriods BIT = 0
+
+/* Remove specific day periods manually e.g. if the student was in sick bay but 
+had not signed out. */
+DECLARE @RemoveDayPeriods BIT = 0
+
+/* Remove all international parents (default to Y). */
+DECLARE @RemoveInternationalParents BIT = 1
+
+/* Create output CSVs automatically? If not they should be saved manually. */
+DECLARE @CreateCsvOutput BIT = 1
+
+
+
+/* ==================================================================================== */
+/* Working variables. */
+/* ==================================================================================== */
+
+
+DECLARE @TodayStr       VARCHAR(100) = (select format((select getdate()), 'dd.MM.yyyy'))
+DECLARE @InfectedName   VARCHAR(MAX)
+DECLARE @DebugDatasets  BIT = 1
+DECLARE @LogMessage     VARCHAR(MAX)
+DECLARE @ErrorMessage   VARCHAR(MAX)
+DECLARE @SqlCmd         NVARCHAR(MAX)
+DECLARE @Cmd            VARCHAR(8000)  -- XP_CMDSHELL can only handle VARCHAR(8000), not MAX.
+DECLARE @RC             INT
+
+
+
+/* ==================================================================================== */
+/* #################################################################################### */
+/* BEGIN MAIN. */
+/* #################################################################################### */
+/* ==================================================================================== */
+
+
+
+/* ==================================================================================== */
+/* CONTACT DATES LIST. */
+/* ==================================================================================== */
+
+
+if OBJECT_ID('tempdb.dbo.#DateList') is not NULL drop table #DateList
+CREATE TABLE #DateList (
+    Date DATE)
+    
+
+if @ContactDate is not NULL and @ContactDateList is not NULL BEGIN 
+
+    set @ErrorMessage = 'ERROR!!! Multiple date variables specified. Exiting.'
+    RETURN
+    -- GOTO REPORT_ERROR
+
+END
+ELSE IF @ContactDateList is not NULL begin 
+
+    /* User has provided a list of dates - use recursion to 
+    split the string into a dataset. */
+
+    ; with DateListSplitter(DateString, DateList) as (
+        select 
+            SUBSTRING(@ContactDateList, 1, CHARINDEX(',', @ContactDateList) - 1), 
+            STUFF(@ContactDateList, 1, CHARINDEX(',', @ContactDateList), '') 
+
+        union all 
+
+        select 
+            SUBSTRING(DateList, 1, CHARINDEX(',', DateList + ',') - 1), 
+            STUFF(DateList + ',', 1, CHARINDEX(',', DateList + ','), '') 
+        from DateListSplitter
+        where LEN(DateList) > 1
+    )
+
+    insert into #DateList
+    select CAST(DateString AS DATE)
+    from DateListSplitter
+
+end
+else if @ContactDate is not NULL begin 
+
+    /* Use SQL recursion here to generate a list of all dates 
+    from the initial contact date counting back for the number of days included. */
+
+    ; With DateList(Date, DayCounter) as (
+
+        select @ContactDate, 0
+
+        union all 
+
+        select DATEADD(day, -(1 + DayCounter), @ContactDate), DayCounter + 1
+        from DateList
+
+        where DayCounter < @IncludeDaysPrior
+    )
+
+    insert into #DateList
+    select Date     
+    from DateList
+
+end 
+ELSE BEGIN
+
+    SET @ErrorMessage = 'ERROR!!! Required date control variables not set properly. Exiting.'
+    RETURN
+    -- GOTO REPORT_ERROR
+
+END
+
+
+if @DebugDatasets = 1 
+    select * 
+    from #DateList
+
+
+
+/* ============================================================================================ */
+/* LIST OF CLASSES TO OBTAIN CONTACTS FOR. */
+/* ============================================================================================ */
+
+
+/* 
+Select only the classes which were timetabled for some period 
+on the corresponding days. 
+Note that Junior School generally only timetables the tutor group class. 
+*/
+
+
+if OBJECT_ID('tempdb.dbo.#ClassTimetable') is not NULL 
+    drop table #ClassTimetable
+
+create table #ClassTimetable (
+    FileYear            INT,
+    FileSemester        INT,
+    ClassCode           VARCHAR(100),
+    Date                DATE, 
+    DayNumber           INT,
+    DayName             VARCHAR(100),
+    PeriodNumber        INT, 
+    StaffID             INT, 
+    Room                VARCHAR(100),
+    ClassStart          TIME,
+    ClassFinish         TIME)
+
+
+/* 
+The classes which get identified depend on user variables, e.g. 
+if a StudentId is specified then we select all classes that student 
+was in on the nominated dates; if a year level is specified, we 
+select all classes for that year level - and so forth.
+*/
+
+if @StudentId is NOT NULL begin 
+
+    set @InfectedName = (SELECT NameExternal from Community where ID = @StudentId)
+    SET @LogMessage = 'Getting class contacts for student ' + @InfectedName
+    print @LogMessage
+
+    
+    /* 
+    Get all classes for this student which were timetabled for the specified dates, 
+    and where the student was not absent. 
+    */
+
+    if OBJECT_ID('tempdb.dbo.#ClassTimetableAbsences') is not NULL 
+        drop table #ClassTimetableAbsences
+        
+    select distinct
+        STC.FileYear,
+        STC.FileSemester,
+        STC.ClassCode,
+        DL.Date, 
+        DATEPART(WEEKDAY, DL.Date) - 1 as DayNumber,
+        DATENAME(WEEKDAY, dl.Date) as DayName,
+        TT.PeriodNumber, 
+        TT.StaffID, 
+        TT.Room,
+        CAST(TTD.TimeFrom AS TIME) as ClassStart,
+        CAST(TTD.TimeTo AS TIME) as ClassFinish,
+        AE.AbsenceEventTypeCode,
+        AE.SchoolInOutStatus,
+        AE.EventTime as AbsenceEventTime
+    into #ClassTimetableAbsences
+    from StudentClasses as STC
+    left join #DateList as DL
+        on 1=1
+    left join Timetable as TT
+        on STC.FileYear = TT.FileYear 
+        and STC.FileSemester = TT.FileSemester 
+        and DATEPART(WEEKDAY, DL.Date) - 1 = TT.DayNumber
+        and STC.ClassCode = TT.ClassCode
+    left join TimetableDefinition as TTD
+        on STC.FileYear = TTD.FileYear
+        AND STC.FileSemester = TTD.FileSemester
+        and TT.PeriodNumber = TTD.PeriodNumber
+        -- Exclude non-attendance periods such as lunch, after school, etc.
+        and TTD.AttendanceEntryEnabledFlag = 1 
+    left join AbsenceEvents as AE
+        on STC.ID = AE.ID
+        and AE.EventDate = DL.Date
+        and AE.SupersededByAbsenceEventsSeq is NULL
+        and AE.AbsenceEventTypeCode in (
+            'AllDayAbsence', 'SignIn', 'SignOut')
+    where 
+        STC.FileYear in (
+            select distinct Year(Date) 
+            from #DateList)
+        AND STC.FileSemester in (
+            select distinct 
+                case when month(Date) <= 6 then 1 
+                else 2 end 
+            from #DateList)
+        and STC.ID = @StudentId
+        and (STC.StopDate is NULL 
+            or DATEDIFF(day, getdate(), STC.StopDate) > 0)
+        AND TT.TimetableSeq is not NULL       
+
+
+    if @DebugDatasets = 1 
+        select * 
+        from #ClassTimetableAbsences
+        order by DayNumber, PeriodNumber
+        
+
+    /* Remove any classes that the infected student was absent for. */
+    insert into #ClassTimetable
+    SELECT distinct
+        CTA.FileYear,
+        CTA.FileSemester,
+        CTA.ClassCode,
+        CTA.Date, 
+        CTA.DayNumber,
+        CTA.DayName,
+        CTA.PeriodNumber, 
+        CTA.StaffID, 
+        CTA.Room,
+        CTA.ClassStart,
+        CTA.ClassFinish
+    from #ClassTimetableAbsences as CTA
+    left join StudentYears as SY
+        on CTA.FileYear = SY.FileYear 
+        and @StudentId = SY.ID
+    left join luYearLevel as luYL
+        on SY.YearLevel = luYL.Code
+    where         
+        AbsenceEventTypeCode is NULL 
+        or (
+            /* Keep sign in/out for students in JS because their 
+            timetable is not reliable. */
+            luYL.Campus = 'J'
+            and AbsenceEventTypeCode <> 'AllDayAbsence')
+        or (
+            AbsenceEventTypeCode <> 'AllDayAbsence'
+            /* Exclude a class if sign in/out absence event places the student 
+            out of school during that class period. */
+            and NOT (AbsenceEventTypeCode = 'SignIn' 
+                and DATEDIFF(Minute, CTA.ClassFinish, CAST(AbsenceEventTime AS TIME)) > 0)
+            and NOT (AbsenceEventTypeCode = 'SignOut' 
+                and DATEDIFF(Minute, CAST(AbsenceEventTime AS TIME), CTA.ClassStart) > 0)) 
+    
+    SELECT @RC = @@ROWCOUNT
+    print 'Got ' + cast(@RC as varchar(10)) 
+        + ' day periods where the infected student was not absent.'
+    
+end
+else if @StaffId is NOT NULL begin 
+
+    set @InfectedName = (select NameExternal from Community where ID = @StaffId)
+    set @LogMessage = 'Getting all classroom contacts for staff member ' + @InfectedName
+    print @LogMessage
+
+    /* 
+    Get all classes for this staff member which were timetabled for 
+    the specified dates.
+    We assume for now that the staff member was present for all dates. 
+    */
+
+    insert into #ClassTimetable
+    select 
+        SCS.FileYear,
+        SCS.FileSemester,
+        SCS.ClassCode,
+        DL.Date, 
+        DATEPART(WEEKDAY, DL.Date) - 1 as DayNumber,
+        DATENAME(weekday, dl.Date) as DayName,
+        TT.PeriodNumber, 
+        TT.StaffID, 
+        TT.Room,
+        CAST(TTD.TimeFrom AS TIME) as ClassStart,
+        CAST(TTD.TimeTo AS TIME) as ClassFinish
+
+    from SubjectClassStaff as SCS
+    left join #DateList as DL
+        on 1=1
+    left join Timetable as TT
+        on SCS.FileYear = TT.FileYear 
+        and SCS.FileSemester = TT.FileSemester 
+        and DATEPART(WEEKDAY, DL.Date) - 1 = TT.DayNumber
+        and SCS.ClassCode = TT.ClassCode
+    left join TimetableDefinition as TTD
+        on SCS.FileYear = TTD.FileYear
+        AND SCS.FileSemester = TTD.FileSemester
+        and TT.PeriodNumber = TTD.PeriodNumber
+        -- Exclude non-attendance periods such as lunch, after school, etc.
+        and TTD.AttendanceEntryEnabledFlag = 1 
+    where 
+        SCS.FileYear in (
+            select distinct Year(Date) 
+            from #DateList)
+        AND SCS.FileSemester in (
+            select distinct 
+                case when month(Date) <= 6 then 1 
+                else 2 end 
+            from #DateList)
+        and SCS.StaffID = @StaffId
+        AND TT.TimetableSeq is not NULL
+
+end
+else if @YearLevel is NOT NULL begin 
+
+    print 'Getting all classroom contacts for YearLevel ' 
+        + cast(@YearLevel as varchar(10))
+
+    /* Get all classes for this year level which were timetabled on the nominated dates. */ 
+
+    insert into #ClassTimetable
+    select 
+        SUC.FileYear,
+        SUC.FileSemester,
+        SUC.ClassCode,
+        DL.Date, 
+        DATEPART(WEEKDAY, DL.Date) - 1 as DayNumber,
+        DATENAME(weekday, dl.Date) as DayName,
+        TT.PeriodNumber, 
+        TT.StaffID, 
+        TT.Room,
+        CAST(TTD.TimeFrom AS TIME) as ClassStart,
+        CAST(TTD.TimeTo AS TIME) as ClassFinish
+    from SubjectClasses as SUC 
+    left join #DateList as DL
+        on 1=1
+    left join Timetable as TT
+        on SUC.FileYear = TT.FileYear 
+        and SUC.FileSemester = TT.FileSemester 
+        and DATEPART(WEEKDAY, DL.Date) - 1 = TT.DayNumber
+        and SUC.ClassCode = TT.ClassCode
+    left join TimetableDefinition as TTD
+        on SUC.FileYear = TTD.FileYear
+        AND SUC.FileSemester = TTD.FileSemester
+        and TT.PeriodNumber = TTD.PeriodNumber
+        -- Exclude non-attendance periods such as lunch, after school, etc.
+        and TTD.AttendanceEntryEnabledFlag = 1 
+    where 
+        SUC.FileYear in (
+            select distinct Year(Date) 
+            from #DateList)
+        AND SUC.FileSemester in (
+            select distinct 
+                case when month(Date) <= 6 then 1 
+                else 2 end 
+            from #DateList)
+        AND SUC.NormalYearLevel = @YearLevel
+        AND TT.TimetableSeq is not NULL
+
+end 
+else begin 
+
+    set @ErrorMessage = 'ERROR!!! One or more necessary variables not set. Exiting.' 
+    RETURN
+    --GOTO REPORT_ERROR
+
+end
+
+
+
+if @DebugDatasets = 1 
+    select *
+    from #ClassTimetable
+    order by DayNumber, PeriodNumber, ClassCode
+
+
+
+/* 
+Add any other classes which were scheduled for the same day and period 
+in the same room (sometimes multiple classes share a room).
+*/
+
+insert into #ClassTimetable
+output 
+    'INSERTED SHARED ROOM' as Action, 
+    INSERTED.*
+select 
+    TT.FileYear, 
+    TT.FileSemester,
+    TT.ClassCode,
+    DL.Date as Date,
+    TT.DayNumber,
+    DATENAME(WEEKDAY, DL.Date) as DayName, 
+    TT.PeriodNumber,
+    TT.StaffID,
+    TT.Room,
+    CAST(TTD.TimeFrom AS TIME) as ClassStart,
+    CAST(TTD.TimeTo AS TIME) as ClassFinish
+from Timetable as TT
+left join #DateList as DL
+    on TT.DayNumber = DATEPART(WEEKDAY, DL.Date) - 1
+left join TimetableDefinition as TTD
+    on TT.FileYear = TTD.FileYear
+    AND TT.FileSemester = TTD.FileSemester
+    and TT.PeriodNumber = TTD.PeriodNumber
+    -- Exclude non-attendance periods such as lunch, after school, etc.
+    and TTD.AttendanceEntryEnabledFlag = 1 
+where 
+    TT.Room <> '' 
+    and TT.Room is not NULL
+    -- Get any classes with same time & location but NOT same class code. 
+    and exists (
+        select 1
+        from #ClassTimetable as CTT
+        where TT.FileYear = CTT.FileYear
+            and TT.FileSemester = CTT.FileSemester
+            and TT.DayNumber = CTT.DayNumber
+            and TT.PeriodNumber = CTT.PeriodNumber
+            and TT.Room = CTT.Room
+            and TT.ClassCode <> CTT.ClassCode)
+
+
+SELECT @RC = @@ROWCOUNT
+print 'Added ' + cast(@RC as varchar(10)) 
+    + ' class periods which were timetabled for the same rooms & periods.'
+
+if @RC > 0 and @DebugDatasets = 1 
+    select *
+    from #ClassTimetable
+    order by DayNumber, PeriodNumber, ClassCode
+    
+
+
+
+
+if @AddExtraClassPeriods = 1 begin 
+
+    ; with ExtraClassPeriods as (
+        select 
+            T.*, 
+            TTD.TimeFrom as ClassStart,
+            TTD.TimeTo as ClassFinish
+        from (values 
+            (2022, 1, 'XXXXXX', '2022-03-17', 4, 'Thursday', 1, 12345, '')
+        ) as T(
+            FileYear, FileSemester, ClassCode, Date, DayNumber,
+            DayName, PeriodNumber, StaffId, Room)
+        left join TimetableDefinition as TTD
+            on T.FileYear = TTD.FileYear
+            and T.FileSemester = TTD.FileSemester
+            and T.PeriodNumber = TTD.PeriodNumber
+    )
+
+
+    insert into #ClassTimetable (
+        FileYear, FileSemester, ClassCode, Date, DayNumber,
+        DayName, PeriodNumber, StaffId, 
+        Room, ClassStart, ClassFinish)
+    output 
+        'INSERTED CLASS DAY PERIOD' AS Action,
+        INSERTED.*
+    select *
+    from ExtraClassPeriods
+
+    set @RC = @@ROWCOUNT
+
+    PRINT 'Added ' + CAST(@RC as varchar(10)) + ' extra class periods manually.'
+
+    if @RC > 0 and @DebugDatasets = 1 
+        select *
+        from #ClassTimetable
+        order by DayNumber, PeriodNumber, ClassCode
+
+end
+
+
+
+
+if @RemoveDayPeriods = 1 begin 
+
+    delete
+    from #ClassTimetable
+    output 'DELETED DAY PERIOD' as Action, DELETED.*
+    where 
+        Date = '2022-03-10' 
+        and PeriodNumber in (3, 4)
+
+    set @RC = @@ROWCOUNT
+
+    PRINT 'Removed ' + CAST(@RC as varchar(10)) + ' day periods manually.'
+
+    if @RC > 0 and @DebugDatasets = 1 
+        select *
+        from #ClassTimetable
+        order by DayNumber, PeriodNumber, ClassCode
+
+end
+
+
+
+
+/* ============================================================================================ */
+/* GET STUDENTS FOR THE CONTACT CLASSES. */
+/* ============================================================================================ */
+
+
+
+if OBJECT_ID('tempdb.dbo.#ClassStudents') is not NULL 
+    drop table #ClassStudents
+
+select 
+    CTT.*,
+    SUC.Description as ClassDescription,
+    SUC.NormalYearLevel as ClassNormalYearLevel,
+    STC.ID as StudentId,
+    SY.YearLevel as StudentYearLevel
+into #ClassStudents
+from #ClassTimetable AS CTT
+INNER join StudentClasses as STC
+    on STC.FileYear = CTT.FileYear
+    and STC.FileSemester = CTT.FileSemester
+    and CTT.ClassCode = STC.ClassCode
+    and (STC.StopDate is NULL 
+        or DATEDIFF(day, CTT.Date, STC.StopDate) > 0)
+INNER JOIN StudentYears as SY
+    on STC.ID = SY.ID
+    and CTT.FileYear = SY.FileYear
+    and SY.Status not in ('LEF', 'EXT')
+left join SubjectClasses as SUC
+    on STC.FileYear = SUC.FileYear
+    and STC.FileSemester = SUC.FileSemester 
+    and STC.ClassCode = SUC.ClassCode
+where 
+    -- Obviously we don't need to notify the infected student's parents. 
+    (@StudentId is NULL 
+    or STC.ID <> @StudentId)
+
+
+if @DebugDatasets = 1 
+    select * 
+    from #ClassStudents
+    ORDER BY Date, ClassCode, StudentId
+
+
+
+/* 
+Exclude focused study classes for any Y12 student as the classes in Synergy 
+are not valid (students may move around across multiple rooms). 
+However, for Focused Study Y12s, we must locate which room they are in by talking 
+to the HoY etc., then obtain close contacts for that room. 
+Y11 focused study classes SHOULD be included as per usual. 
+*/
+delete 
+from #ClassStudents
+output 'DELETED Y12 FOC STUDY' as Action, DELETED.*
+where StudentYearLevel = 12 
+    and ClassDescription like '%foc%stud%'
+
+set @RC = @@ROWCOUNT
+if @RC > 0 and @DebugDatasets = 1 begin 
+
+    print 'Removed ' + cast(@RC as varchar(100)) + ' Y12 students in Focused Study.'
+    print 'Don''t forget to track down student rolls for Focused Study and add students who shared a room with contact!'
+
+    select * 
+    from #ClassStudents
+    ORDER BY Date, ClassCode, StudentId
+end 
+
+
+
+/* ============================================================================================ */
+/* REMOVE STUDENTS WHO WERE ABSENT. */
+/* ============================================================================================ */
+
+/* 
+We exclude a student if they signed in after a class finished, or signed out
+before a class started, or (obviously) if they have an all-day absence. 
+*/
+
+if OBJECT_ID('tempdb.dbo.#StudentAbsences') is not NULL drop table #StudentAbsences
+select distinct
+    CS.*, 
+    AE.AbsenceEventTypeCode, 
+    CAST(AE.EventTime AS TIME) as EventTime
+into #StudentAbsences
+from #ClassStudents as CS
+left join AbsenceEvents as AE
+    on CS.Date = AE.EventDate
+    and CS.StudentId = AE.ID
+    and AE.SupersededByAbsenceEventsSeq is NULL
+    and AE.AbsenceEventTypeCode in (
+        'AllDayAbsence', 'SignIn', 'SignOut')
+order by CS.Date, CS.PeriodNumber, CS.StudentId
+
+
+if @DebugDatasets = 1
+    select *
+    from #StudentAbsences
+
+    
+
+if OBJECT_ID('tempdb.dbo.#ContactsOnSite') is not NULL 
+    drop table #ContactsOnSite
+
+select distinct
+    SA.*
+into #ContactsOnSite
+from #StudentAbsences as SA
+left join StudentYears as SY
+    on SA.FileYear = SY.FileYear 
+    and @StudentId = SY.ID
+left join luYearLevel as luYL
+    on SY.YearLevel = luYL.Code
+    and luYL.Campus = 'WC'
+where 
+    SA.AbsenceEventTypeCode is NULL 
+    or (
+        /* Keep sign in/out for students in JS because their 
+        timetable is not reliable. */
+        SY.YearLevel <= 6
+        and AbsenceEventTypeCode <> 'AllDayAbsence' )
+    OR (
+        /* If an absence event is found for any student, we determine if the absence event
+        places them out of school during a particular class period. If so, remove. */
+        SA.AbsenceEventTypeCode <> 'AllDayAbsence'  
+        and not (SA.AbsenceEventTypeCode = 'SignIn' 
+            and DATEDIFF(Minute, SA.ClassFinish, CAST(SA.EventTime AS TIME)) > 0)
+        and not (SA.AbsenceEventTypeCode = 'SignOut' 
+            and DATEDIFF(Minute, CAST(SA.EventTime AS TIME), SA.ClassStart) > 0))
+order by 
+    SA.Date, SA.PeriodNumber, SA.StudentId
+
+
+if @DebugDatasets = 1 
+    select *
+    from #ContactsOnSite
+    order by ClassCode, StudentId
+
+
+
+
+
+
+
+/* ============================================================================================ */
+/* IDENTIFY BUS TRIPS FOR STUDENT AND ADD FELLOW PASSENGERS. */
+/* ============================================================================================ */
+
+
+if @AddBusPassengersAutomatically = 1 begin 
+
+    PRINT 'Adding bus passenger data automatically from BusMinder report file for today.'
+
+
+    if OBJECT_ID('tempdb.dbo.#BusPassengers') is not NULL drop table #BusPassengers
+    create table #BusPassengers (
+        StudentId       int,
+        Name            varchar(500),
+        Trip            varchar(500),
+        Stop            varchar(500),
+        BoardingDateTime    DateTime,
+        Price           decimal(10, 2))
+
+
+    /* Need to use command string because OPENROWSET doesn't allow concatenated paths. */
+    set @SqlCmd = 
+        'INSERT INTO #BusPassengers
+        SELECT *
+        from OPENROWSET (
+            BULK ''\\<SERVER_NAME>\reports$\InputDataFiles\BusMinder_' 
+            + (SELECT FORMAT(GETDATE(), 'yyyy.MM.dd'))
+            + '.csv'',
+            formatfile = ''\\<SERVER_NAME>\reports$\InputDataFiles\BusMinder_input_fmt.xml'',
+            firstrow=2
+        ) as T'
+
+    EXEC sp_executesql @SqlCmd
+
+
+    /* Confirm that the bus data file contains information for the dates we are concerned with. */
+    
+    if OBJECT_ID('tempdb.dbo.#MissingBusDataDates') is not NULL drop table #MissingBusDataDates
+    select distinct COS.Date
+    into #MissingBusDataDates
+    from #ContactsOnSite as COS
+    where COS.Date not in (
+        select distinct cast(BoardingDateTime as Date)
+        from #BusPassengers)
+
+
+    set @RC = @@ROWCOUNT
+    if @RC <> 0 begin 
+        print 'WARNING: No bus passenger data found for the following dates: '
+
+        set @LogMessage = (
+            SELECT STUFF(
+                (select ', ' + cast(Date as varchar(100)) 
+                from #MissingBusDataDates for xml path('')),
+                1, 2, ''))
+        print @LogMessage
+
+        print 'WARNING: Make sure you have downloaded the most recent BusMinder report before proceeding.'
+        RETURN
+    END
+
+
+    /* Check which trips this student was on, if any. 
+    Add fellow passengers to the Classroom Contacts data. */
+
+    if OBJECT_ID('tempdb.dbo.#InfectedStudentTrips') is not NULL drop table #InfectedStudentTrips
+    select distinct 
+        Trip, 
+        cast(BP.BoardingDateTime as DATE) as TripDate
+    into #InfectedStudentTrips
+    from #BusPassengers as BP
+    where BP.StudentId = @StudentId
+        and cast(BP.BoardingDateTime as DATE) in (
+            select distinct Date
+            from #ContactsOnSite)
+
+
+    set @RC = @@ROWCOUNT
+    if @RC = 0 begin         
+        print 'Infected student NOT found in bus passenger data for contact days.' 
+    end
+    else if @RC > 0 begin 
+        
+        print 'Infected student travelled on the following bus trips on contact days: ' 
+        set @LogMessage = (
+            SELECT STUFF(
+                (select 
+                    ', ' 
+                    + cast(Trip as varchar(100)) 
+                    + ' - ' 
+                    + format(TripDate, 'dd/MM/yyyy')
+                from #InfectedStudentTrips for xml path('')),
+                1, 2, ''))
+        print @LogMessage
+
+
+
+        insert into #ContactsOnSite
+        OUTPUT 
+            'STUDENT INSERT BUS TRIP' AS Action,
+            INSERTED.*
+        select distinct
+            YEAR(BP.BoardingDateTime) AS FileYear,
+            CASE WHEN DATEPART(MONTH, BP.BoardingDateTime) <= 6 THEN 1 ELSE 2 END AS FileSemester,
+            NULL as ClassCode,
+            CAST(BP.BoardingDateTime as DATE) as Date,
+            DATEPART(WEEKDAY, BP.BoardingDateTime) - 1 as DayNumber,
+            DATENAME(WEEKDAY, BP.BoardingDateTime) as DayName,
+            NULL as PeriodNumber, 
+            NULL as StaffId,
+            NULL as Room,
+            NULL as ClassStart,
+            NULL as ClassFinish,
+            NULL as ClassDescription,
+            NULL as ClassNormalyearLevel,
+            BP.StudentId,
+            NULL as StudentYearLevel,
+            NULL as AbsenceEventTypeCode, 
+            NULL as EventTime
+        from #BusPassengers as BP
+        INNER join #InfectedStudentTrips as IST
+            ON BP.Trip = IST.Trip
+            AND CAST(BP.BoardingDateTime AS DATE) = IST.TripDate
+        where cast(BP.BoardingDateTime as DATE) in (
+            select distinct Date
+            from #ContactsOnSite)
+
+        print 'Added ' + CAST(@@ROWCOUNT AS VARCHAR(10)) + ' bus passengers automatically.'
+    
+        if @DebugDatasets = 1 
+            select * 
+            from #ContactsOnSite
+
+    end
+end
+
+
+
+/* ============================================================================================ */
+/* ADD EXTRA CLASSROOM CONTACTS WHO HAVE BEEN MANUALLY IDENTIFIED. */
+/* ============================================================================================ */
+
+/* 
+Note that this step assumes students are present - no absences are checked for. 
+*/
+
+if @IncludeExtraStudents = 1 begin 
+
+    insert into #ContactsOnSite
+    OUTPUT 
+        'STUDENT INSERT MANUAL' AS Action,
+        INSERTED.*
+    select
+        DATEPART(YEAR, GETDATE()) AS FileYear,
+        CASE WHEN DATEPART(MONTH, GETDATE()) <= 6 THEN 1 ELSE 2 END AS FileSemester,
+        NULL as ClassCode,
+        NULL as Date,
+        NULL as DayNumber,
+        NULL as DayName,
+        NULL as PeriodNumber, 
+        NULL as StaffId,
+        NULL as Room,
+        NULL as ClassStart,
+        NULL as ClassFinish,
+        NULL as ClassDescription,
+        NULL as ClassNormalyearLevel,
+        Extras.ID,
+        NULL as StudentYearLevel,
+        NULL as AbsenceEventTypeCode, 
+        NULL as EventTime
+    from (values  
+        (12345)
+   ) as Extras(Id) 
+    print 'Added ' + CAST(@@ROWCOUNT AS VARCHAR(10)) 
+        + ' extra students who have been manually identified.'
+    
+    select * 
+    from #ContactsOnSite
+
+end 
+else begin 
+    print 'No extra students manually added to this extract.'
+end
+
+
+
+
+
+/* ============================================================================================ */
+/* REMOVE STUDENTS WHO ARE CURRENTLY ISOLATING. */
+/* ============================================================================================ */
+
+
+/* 
+If a student's parents have already notified us that the student is covid positive and is 
+isolating, we don't need to notify them that their child is a classroom contact for the 
+current student. So we remove them from output. 
+*/
+
+
+declare @IsolatingStudents varchar(max) = (
+    SELECT 
+        STUFF(
+            (select distinct
+                ',' + CAST(StudentId AS VARCHAR(10))
+            from #ContactsOnSite
+            where StudentId in (
+                select ID
+                from woodcroft.uCovidPositive
+                where DATEDIFF(DAY, TestDate, GETDATE()) <= @IsolationDays)
+            for xml path('')),
+            1, 1, ''))
+
+PRINT 'Students currently isolating who will be removed: ' + ISNULL(@IsolatingStudents, 'NONE')
+
+if @IsolatingStudents is not NULL begin 
+
+    declare @SQL NVARCHAR(MAX) = '
+        delete
+        from #ContactsOnSite
+        output 
+            ''STUDENT DELETED ISOLATING'' AS Action, 
+            DELETED.*
+        where StudentId in (' + @IsolatingStudents + ')'
+
+    exec sp_executesql @SQL
+
+    select @RC = @@ROWCOUNT
+    print 'Deleted ' + CAST(@RC AS VARCHAR(100)) + ' class contact records for students who are already isolating.'
+
+    if @DebugDatasets = 1 and @RC > 0
+        select *
+        from #ContactsOnSite
+        order by ClassCode, StudentId
+
+end
+
+
+
+
+
+
+
+/* ============================================================================================ */
+/* FINAL CLEAN-UP: Delete any records containing the infected source student - obviously 
+        don't need to notify their parents. */
+/* ============================================================================================ */
+
+delete 
+from #ContactsOnSite 
+where StudentId = @StudentId
+
+SET @RC = @@ROWCOUNT 
+if @RC > 0 begin 
+    print 'Removed ' + cast(@RC as varchar(10)) + ' records who were the infected student.'
+end
+
+
+
+
+/* ============================================================================================ */
+/* PARENTS TO CONTACT. */
+/* ============================================================================================ */
+
+
+if OBJECT_ID('tempdb.dbo.#MyStudentContacts') is not NULL drop table #MyStudentContacts
+
+/* Primary contacts. */
+select distinct
+    COS.StudentId,
+    SC.ContactType,
+    SC.LinkedID as ContactId
+INTO #MyStudentContacts
+from #ContactsOnSite as COS
+left join StudentContacts as SC
+    on COS.StudentId = SC.id
+    and SC.ContactType <> 'SCT'
+    and (SC.LivesWithFlag = 1 or SC.ParentFlag = 1)
+    and SC.NormalMailFlag = 1
+
+union 
+
+/* Contact Spouses. */
+select distinct
+    COS.StudentId,
+    SC.ContactType,
+    COM_SPO.id as ContactId
+from #ContactsOnSite as COS
+left join StudentContacts as SC
+    on COS.StudentId = SC.id
+    and SC.ContactType <> 'SCT'
+    and (SC.LivesWithFlag = 1 or SC.ParentFlag = 1)
+    and SC.NormalMailFlag = 1
+left join Community as COM_CON
+    on SC.LinkedID = COM_CON.ID
+left join Community as COM_SPO
+    on COM_CON.SpouseID = COM_SPO.ID
+    and COM_SPO.DeceasedFlag <> 1
+where COM_SPO.id is not NULL
+
+
+if @DebugDatasets = 1 
+    select * 
+    from #MyStudentContacts
+
+
+
+    
+if OBJECT_ID('tempdb.dbo.#ContactDetails') is not NULL drop table #ContactDetails
+select 
+    MSC.*,
+    COM_STU.Preferred as StudentPreferred,
+    COM_STU.Surname as StudentSurname,
+    COM_CON.Preferred as ContactPreferred,
+    COM_CON.Surname as ContactSurname,
+    case 
+        when COM_CON.DefaultEmailCode = 'O' or COM_CON.Email = '' then COM_CON.OccupEmail
+        else COM_CON.Email
+    end as ContactEmail, 
+    -- See note at Addresses table join.
+    COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) AS CountryCode
+into #ContactDetails
+from #MyStudentContacts as MSC
+left join Community as COM_STU
+    on MSC.StudentId = COM_STU.ID
+left join Community as COM_CON
+    on MSC.ContactId = COM_CON.ID
+/* Need to join Addresses multiple times because it can be linked based on ID, SPOUSEID, 
+or ADDRESSID in the COMMUNITY table. */ 
+left join Addresses as ADDR_CON
+    on COM_CON.Id = ADDR_CON.AddressID
+    and ADDR_CON.ValidAddressFlag = 1
+left join Addresses as ADDR_SPO
+    on COM_CON.SpouseID = ADDR_SPO.AddressID
+    and ADDR_SPO.ValidAddressFlag = 1
+left join Addresses as ADDR_ADDRID
+    on COM_CON.AddressID = ADDR_ADDRID.AddressID
+    and ADDR_ADDRID.ValidAddressFlag = 1
+where (
+    @RemoveInternationalParents = 0
+    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) AS CountryCode is NULL
+    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) AS CountryCode = '' 
+    or COALESCE(ADDR_ADDRID.CountryCode, ADDR_CON.CountryCode, ADDR_SPO.CountryCode) AS CountryCode = 'AUST')
+
+    
+if @DebugDatasets = 1 
+    select * 
+    from #ContactDetails
+
+
+
+
+
+if OBJECT_ID('tempdb.dbo.#ContactNameLists') is not NULL drop table #ContactNameLists
+select distinct 
+    CD.ContactEmail,
+    STUFF(
+        (select distinct ', ' + CD2.ContactPreferred
+        from #ContactDetails as CD2
+        where CD.ContactEmail = CD2.ContactEmail
+        for xml path('')),
+        1, 2, ''
+    ) as ParentNames,
+    STUFF(
+        (select distinct ', ' + CD2.StudentPreferred
+        from #ContactDetails as CD2
+        where CD.ContactEmail = CD2.ContactEmail
+        for xml path('')),
+        1, 2, ''
+    ) as StudentNames
+into #ContactNameLists
+from #ContactDetails as CD
+where CD.ContactEmail <> ''
+    and CD.ContactPreferred <> ''
+
+
+
+/* ============================================================================================ */
+/* MAIN OUTPUT: LIST OF NAMES AND EMAILS FOR NOTIFICATION. */
+/* ============================================================================================ */
+
+
+/* 
+This table is a temporary staging table used to create CSV exports as output from 
+this procedure. It should be refreshed every time this process runs. 
+*/
+--create table woodcroft.uCovidParentEmails_EXPORT (
+--    ContactEmail VARCHAR(MAX),
+--    ParentNames VARCHAR(MAX),
+--    StudentNames VARCHAR(MAX))
+
+
+delete from woodcroft.uCovidParentEmails_EXPORT
+
+insert into woodcroft.uCovidParentEmails_EXPORT
+select 
+    CNL.ContactEmail,
+    case 
+        when CHARINDEX(',', CNL.ParentNames) > 0 then 
+            REVERSE(
+                STUFF(
+                    REVERSE(CNL.ParentNames),
+                    CHARINDEX(' ,', REVERSE(CNL.ParentNames), 1),
+                    2, ' dna '))
+        else CNL.ParentNames
+    end AS ParentNames,
+    case 
+        when CHARINDEX(',', CNL.StudentNames) > 0 then
+            REVERSE(
+                STUFF(
+                    REVERSE(CNL.StudentNames),
+                    CHARINDEX(' ,', REVERSE(CNL.StudentNames), 1),
+                    2, ' dna '))
+        else CNL.StudentNames
+    END AS StudentNames
+from #ContactNameLists as CNL
+order by StudentNames, ParentNames
+
+set @RC = @@ROWCOUNT
+
+
+if @CreateCsvOutput = 1 begin 
+
+    /* Export a CSV containing parent contact info. Need to UNION with a list of column headers. */
+    set @Cmd = 'bcp ' 
+        + '"select ''ContactEmail'', ''ParentNames'', ''StudentNames'' '
+        + 'union all  '
+        + 'select * from <DB_NAME>.woodcroft.uCovidParentEmails_EXPORT" '
+        + 'queryout "\\<SERVER_NAME>\reports$\OutputDataFiles\Parent emails for ' 
+        + @InfectedName
+        + ' - ' + @TodayStr
+        + '.csv" -T -t, -S synergy -c'
+
+    EXEC xp_cmdshell @Cmd
+
+    print CAST(@RC as VARCHAR(10)) + ' parent email records exported to [uCovidParentEmails_EXPORT] staging table.'
+
+    if @DebugDatasets = 1
+        select * 
+        from woodcroft.uCovidParentEmails_EXPORT
+
+end 
+else begin 
+
+    /* No CSV will be created: simply SELECT records so they can be copy & pasted or whatever. */
+    select *
+    from woodcroft.uCovidParentEmails_EXPORT
+
+end 
+
+delete from woodcroft.uCovidParentEmails_EXPORT
+
+
+
+
+/* ====================================================================================================== */
+/* UPDATE OUR RECORD OF STUDENT POSITIVE TEST DATES. */
+/* ====================================================================================================== */
+
+
+/* 
+We maintain a list of students who have notified us that they have tested positive, 
+and the dates they tested on.
+*/
+
+
+
+IF @PositiveTestDate IS NULL BEGIN
+
+    SET @ErrorMessage = 'ERROR!!! Test date should be non-NULL. Exiting.'
+    GOTO REPORT_ERROR
+
+END
+ELSE BEGIN 
+
+    /* 
+    If we already have a record of this student's positive test result for a 
+    given date, we simply update the comment. Otherwise, add a new record. 
+    */
+
+    IF EXISTS (
+            SELECT 1
+            FROM woodcroft.uCovidPositive
+            WHERE ID = @StudentId
+                and TestDate = @PositiveTestDate            
+        ) BEGIN
+
+        UPDATE woodcroft.uCovidPositive 
+            SET Comment = @TestComment
+        WHERE ID = @StudentId
+            and TestDate = @PositiveTestDate
+
+        PRINT '[woodcroft.uCovidPositive] UPDATED comment for user ' 
+            + CAST(@StudentId AS VARCHAR(MAX))
+            + ' test on date ' + FORMAT(@PositiveTestDate, 'dd-MM-yyyy')
+
+    END
+    ELSE BEGIN
+
+        INSERT INTO woodcroft.uCovidPositive(ID, TestDate, Comment)
+        VALUES (
+            ISNULL(@StudentId, @StaffId),
+            @PositiveTestDate,
+            @TestComment)
+
+        PRINT '[woodcroft.uCovidPositive] INSERTED new positive test result for user ' 
+            + CAST(@StudentId AS VARCHAR(MAX))
+            + ' on date ' + FORMAT(@PositiveTestDate, 'dd-MM-yyyy')
+
+    END
+
+    if @DebugDatasets = 1
+        select * 
+        from woodcroft.uCovidPositive
+END
+
+
+/* ============================================================================================ */
+/* SAVE NEW CLASSROOM CONTACTS TO LOG TABLE. */
+/* ============================================================================================ */
+
+
+--create table woodcroft.uCovidClassroomContacts (
+--    Seq int identity not null,
+--    DateModified DATETIME not null,
+--    ContactDate DATE not NULL,
+--    InfectedId int,
+--    StudentId int NOT NULL)
+
+
+MERGE woodcroft.uCovidClassroomContacts AS TARGET
+USING (
+    select distinct 
+        --GETDATE() as DateModified, 
+        ISNULL(Date, GETDATE()) as ContactDate, 
+        @StudentId as InfectedId,    
+        StudentId               
+    from #ContactsOnSite) AS SOURCE
+ON 
+    SOURCE.ContactDate = TARGET.ContactDate
+    and SOURCE.InfectedId = TARGET.InfectedId
+    and SOURCE.StudentId = TARGET.StudentId
+    
+-- Insert new records, otherwise ignore. 
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (
+        --DateModified,
+        ContactDate, 
+        InfectedId, 
+        StudentId) 
+    VALUES (
+        --GETDATE(),
+        SOURCE.ContactDate,
+        SOURCE.InfectedId,
+        SOURCE.StudentId)
+        
+-- Checking the actions by MERGE statement
+OUTPUT $action, DELETED.*, INSERTED.*;
+
+SET @RC = @@ROWCOUNT
+PRINT 'Added ' + cast(@RC as varchar(10)) + ' new classroom contacts to log.'
+
+
+
+
+/* ============================================================================================ */
+/* FINALISE. */
+/* ============================================================================================ */
+
+
+PRINT 'Remember to mail a copy of CONTACTSONSITE to Kirsten Lawson!!!'
+
+--create table woodcroft.uCovidContactsOnSite_EXPORT (
+--    StudentId       VARCHAR(100),
+--    Preferred       VARCHAR(MAX),
+--    Surname         VARCHAR(MAX),
+--    YearLevel       VARCHAR(100),
+--    House           VARCHAR(MAX),
+--    TutorGroup      VARCHAR(MAX))
+
+
+DELETE FROM woodcroft.uCovidContactsOnSite_EXPORT
+
+insert into woodcroft.uCovidContactsOnSite_EXPORT
+SELECT distinct
+    COS.StudentId,
+    COM.Preferred,
+    COM.Surname,
+    sy.YearLevel,
+    SY.House,
+    case when CHARINDEX('_', sy.tutor) > 0 then substring(sy.tutor, 1, charindex('_', sy.tutor) - 1) 
+        else sy.Tutor
+    end as TutorGroup
+from #ContactsOnSite as COS
+left join Community as COM
+    on COS.StudentId = COM.ID
+left join StudentYears as SY
+    on SY.FileYear = year(getdate())
+    and COS.StudentId = SY.ID
+order by COM.Surname, com.Preferred
+
+set @RC = @@ROWCOUNT
+
+/* Export a CSV containing contacts on site list. Need to UNION with a list of column headers. */
+set @Cmd = 'bcp ' 
+    + '"select ''StudentId'', ''Preferred'', ''Surname'', ''YearLevel'', ''House'', ''TutorGroup'' '
+    + 'union all  '
+    + 'select * from <DB_NAME>.woodcroft.uCovidContactsOnSite_EXPORT" '
+    + 'queryout "\\<SERVER_NAME>\reports$\OutputDataFiles\New Classroom Contacts for ' 
+    + @InfectedName
+    + ' - ' + @TodayStr
+    + '.csv" -T -t, -S synergy -c'
+
+
+EXEC xp_cmdshell @Cmd
+
+print CAST(@RC as VARCHAR(10)) + ' contacts on site records exported to [uCovidContactsOnSite_EXPORT] staging table.'
+
+
+if @DebugDatasets = 1
+    select * 
+    from woodcroft.uCovidContactsOnSite_EXPORT
+
+delete from woodcroft.uCovidContactsOnSite_EXPORT
+
+
+
+
+
+
+
+GOTO FINISH
+
+REPORT_ERROR:
+
+    PRINT @ErrorMessage-- as ErrorMessage
+
+FINISH:
+
+
+
