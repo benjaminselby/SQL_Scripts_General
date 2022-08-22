@@ -1,0 +1,129 @@
+create function utfGetAttendanceDates (
+    @StartDate      Date,
+    @EndDate        Date)
+returns @AttendanceDates table (
+    DayDate         Date, 
+    DayNumber       INT,
+    AttendanceCode  varchar(100),
+    Event           varchar(300),
+    Attendance      bit)
+as begin 
+
+    /* 
+    AUTHOR:     Benjamin Selby
+    DATE:       2022.08.22
+
+    Returns a list of days between @StartDate and @EndDate with a bit flag indicting 
+    whether school is in attendance on that day. Depends on the CalendarEvents table 
+    for term start/end dates as well as public holidays. 
+    
+    Flags weekends as non-attending dates. 
+
+    NOTE: the CalendarEvents table sometimes needs to be modified to reflect the fact 
+    that different year levels have different start dates (e.g. at beginning of the year,
+    Year 0-9 may start on Tue, but other years may start on Wed). So, this may not be 
+    perfectly reliable across some term start days. 
+    */
+
+    set @StartDate              = isnull(@StartDate, cast(dateadd(Month, -6, getdate()) as Date))
+    set @EndDate                = isnull(@EndDate, cast(dateadd(Month, 6, getdate()) as Date))
+
+    /* We need to go back further than the start date specified by the caller or else we won't 
+    know which attendance phase we are in for the earlier dates (ie. before a calendar event 
+    is found). 6 months is probably excessive but speed is not crucial here. */
+    declare @StartDateOffset    Date = dateadd(month, -6, @StartDate)
+    
+    declare @DateValue          Date
+    declare @DayNumber          int
+    declare @Event              varchar(300)
+    declare @AttendanceCode     varchar(100)
+    declare @Attendance         bit
+    
+
+    /* Need to use a CURSOR to iterate over dates and flip bit when it encounters an event. 
+    Not sure if this can be done with a JOIN alone. */
+    declare DayCursor cursor for 
+
+        -- Recursive CTE creates list of dates. 
+        with MyDateList(DateValue, DayNumber, Counter) as (
+            select 
+                @StartDateOffset as DateValue, 
+                datepart(Weekday, @StartDateOffset) - 1 as DayNumber,
+                1 as Counter
+            union all 
+            select 
+                cast(dateadd(Day, counter, @StartDateOffset) as Date) as DateValue, 
+                datepart(Weekday, dateadd(Day, counter, @StartDateOffset)) - 1 as DayNumber,
+                Counter + 1 as Counter
+            from MyDateList
+            where DateValue <= dateadd(Day, -1, @EndDate)
+        )
+
+        , MyCalendarEvents as (
+            select 
+                CalendarDate, 
+                CalendarType as AttendanceCode, 
+                Description
+            from CalendarEvents
+            where CalendarDate between @StartDateOffset and @EndDate
+        )
+
+        select 
+            DL.DateValue,
+            DL.DayNumber,
+            CE.AttendanceCode, 
+            CE.Description as Event
+        from MyDateList as DL
+        left join MyCalendarEvents as CE
+            on DL.DateValue = cast(CE.CalendarDate as Date)
+        order by DL.DateValue
+        option (maxrecursion 999)
+
+    open DayCursor
+    fetch next from DayCursor into 
+        @DateValue,   
+        @DayNumber,   
+        @AttendanceCode,
+        @Event
+
+
+    while @@FETCH_STATUS = 0
+    begin 
+
+        if @AttendanceCode like '%[_]D0%' 
+            set @Attendance = 0
+        else if @AttendanceCode like '%[_]D%' 
+            set @Attendance = 1
+
+        /* Only insert values into output table if the date is after the 
+        @StartDate the caller specified. */ 
+        if @StartDate <= @DateValue 
+            insert into @AttendanceDates(
+                DayDate, 
+                DayNumber,
+                AttendanceCode,
+                Event,
+                Attendance)
+            values (
+                @DateValue,
+                @DayNumber,
+                @AttendanceCode,
+                @Event,
+                -- Set all weekends as 'non-attending' days. 
+                case when @DayNumber in (6, 0) then 0
+                    else @Attendance
+                end)
+
+        fetch next from DayCursor into 
+            @DateValue,   
+            @DayNumber,   
+            @AttendanceCode,
+            @Event
+    end
+
+    close DayCursor
+    deallocate DayCursor
+
+    RETURN 
+
+END
