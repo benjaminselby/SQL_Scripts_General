@@ -406,9 +406,9 @@ as begin
         Standard Error of the Prediction at X'
         (Note that this changes for different values of X')
 
-                                    (           (X' - Mean(X))^2 )
+                                  (           (X' - Mean(X))^2 )
             =       SE(est) * SQRT( 1 + 1/N + ---------------- )
-                                    (                 SS(X)      ) 
+                                  (                 SS(X)      ) 
 
     */
 
