@@ -1,0 +1,56 @@
+/* 
+The intention of this script is to create a list of teachers and the finish time of their last 
+Learning Conversation (ie. parent teacher interview) for the given night. 
+*/
+
+
+with MyLearningConversations as (
+    select 
+        LC.StaffID,
+        LC.StaffFname, 
+        LC.StaffSurname, 
+        format(LC.TimeStart, 'hh\:mm_tt') as TimeStart, 
+        format(dateadd(Minute, 8, LC.TimeStart), 'hh\:mm_tt') as TimeFinish,
+        LC.ContactTitle + ' ' + LC.ContactFname + ' ' + LC.ContactSurname
+            + case when LC.SpouseId is not NULL 
+                    then ' & ' + LC.SpouseTitle + ' ' + LC.SpouseFname + ' ' + LC.SpouseSurname
+                    else ''
+                end 
+            + ' (' + LC.StudentFname + ' ' + LC.StudentSurname + ')'
+            as Details
+    from woodcroft.uvLearningConversations as LC
+    where LC.PTICycleCode = '2022_3'
+        and LC.SessionDate = '2022-09-07'
+)
+
+, MyLastBookingsFinish as (
+    select distinct
+        StaffId, 
+        max(TimeFinish) over (Partition by StaffId) as LastBookingFinish
+    from MyLearningConversations as LC
+    where Details is not NULL
+)
+
+select 
+    P.*, 
+    BF.LastBookingFinish
+from (
+    select 
+        LC.StaffID, LC.StaffFname, LC.StaffSurname, 
+        LC.TimeStart, LC.Details
+    from MyLearningConversations as LC
+    ) as T
+    pivot (
+        Max(Details) 
+        for TimeStart in (
+            [03:30_PM], [03:38_PM], [03:46_PM], [03:54_PM], [04:02_PM], [04:10_PM], [04:18_PM], 
+            [04:26_PM], [04:34_PM], [04:42_PM], [04:50_PM], [04:58_PM], [05:06_PM], [05:14_PM], 
+            [05:22_PM], [05:30_PM], [05:38_PM], [05:46_PM], [05:54_PM], [06:02_PM], [06:10_PM], 
+            [06:18_PM], [06:26_PM], [06:34_PM], [06:42_PM], [06:50_PM], [06:58_PM], [07:06_PM], 
+            [07:14_PM], [07:22_PM], [07:30_PM], [07:38_PM], [07:46_PM], [07:54_PM])
+    ) as P
+left join MyLastBookingsFinish as BF
+    on P.StaffID = BF.StaffID
+-- Remove staff who have no interviews at all. 
+where BF.LastBookingFinish is not NULL
+order by BF.LastBookingFinish ASC
