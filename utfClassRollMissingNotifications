@@ -1,0 +1,151 @@
+
+CREATE function [woodcroft].[utfClassRollMissingNotifications] (
+    @DelayMinutes INT = 15)
+returns @Notifications table (
+    DayNumber           int, 
+    PeriodNumber        int,
+    ClassCode           varchar(100),
+    Lesson              varchar(100),
+    TimeFrom            Time,
+    TimeTo              Time,
+    Description         varchar(500),
+    NormalYearLevel     INT, 
+    StaffId             INT, 
+    ReliefTeacherId     INT,
+    RollStaffId         INT, 
+    RollStaffEmail      varchar(500))
+as begin 
+
+    /* 
+    AUTHOR: Benjamin Selby
+    DATE: 2022/08/01
+
+    Created to compliment the procedure [woodcroft].[uspsClassRollsNotSubmitted]. 
+    Provides output in a format suitable for notifications to be sent to staff 
+    who have not completed rolls for classes by a given point in the day. 
+    Checks the notification log table, only returns records if a notification 
+    has not been sent. This prevents staff from being spammed multiple times in a 
+    day for a single missed class.
+
+    NOTE: This EXCLUDES Junior School for the time being. May include later on. 
+
+    MODIFICATIONS ======================================================================
+
+    [2022.08.31 selby_b] In some cases, there will be NO relief assigned for certain 
+        classes when a teacher is absent. For example, in order to minimise reliefs, 
+        it was decided that the second period of a two-period Y12 class may not have 
+        a relief assigned. This means that the ReliefTeacherId will be null, so the 
+        system thinks that the notification should go to the original staff member 
+        (who is absent). 
+
+        To resolve this, I merged on TeacherAbsences and we exclude any output where 
+        there is no Relief assigned and the usual teacher is absent.     
+
+    */
+
+    declare @DateTime   DateTime = getdate()
+    declare @Date       Date = cast(@DateTime as Date)
+
+    
+    declare @ClassRollsNotSubmitted table (
+        DayNumber           INT, 
+        PeriodNumber        INT,
+        Lesson              Varchar(200),
+        ClassCode           varchar(200),
+        TimeFrom            Time, 
+        TimeTo              Time, 
+        Description         varchar(500),
+        NormalYearLevel     INT, 
+        StaffId             INT, 
+        ReliefTeacherId     INT)
+
+    insert into @ClassRollsNotSubmitted
+    select 
+        DayNumber,
+        PeriodNumber,
+        Lesson,
+        ClassCode,
+        TimeFrom,
+        TimeTo,
+        Description,
+        NormalYearLevel,
+        StaffId,
+        ReliefTeacherId
+    from woodcroft.utfClassRollsMissingToday(@DelayMinutes)
+
+
+    /* OUTPUT ============================================================== */ 
+
+    ; with TeacherAbsences as (
+        select Distinct 
+            Date, 
+            Period,
+            TeacherCode, 
+            ID,
+            AbsenceReasonId
+        from dailyOrganiser.uTeacherAbsences
+        where Date = @Date
+    )
+
+
+    insert into @Notifications (
+        DayNumber,
+        PeriodNumber,
+        ClassCode,
+        Lesson,
+        TimeFrom,
+        TimeTo,
+        Description,
+        NormalYearLevel,
+        StaffId,
+        ReliefTeacherId,
+        RollStaffId,
+        RollStaffEmail)
+    select distinct 
+        RNS.DayNumber, 
+        RNS.PeriodNumber,
+        RNS.ClassCode,
+        RNS.Lesson,
+        RNS.TimeFrom,
+        RNS.TimeTo,
+        RNS.Description,
+        RNS.NormalYearLevel,
+        RNS.StaffId, 
+        RNS.ReliefTeacherId, 
+        COM.ID as RollStaffId, 
+        COM.OccupEmail as RollStaffEmail
+    from @ClassRollsNotSubmitted as RNS
+    left join Community as COM 
+        on isnull(RNS.ReliefTeacherId, RNS.StaffId) = COM.ID
+    left join woodcroft.uClassRollsMissingNotificationLog as LOG
+        on cast(@DateTime as Date) = LOG.Date
+        and RNS.PeriodNumber = LOG.PeriodNumber
+        and RNS.ClassCode = LOG.ClassCode
+        and (RNS.StaffId = LOG.StaffId
+            or RNS.ReliefTeacherId = LOG.StaffId)
+    left join TeacherAbsences as TA
+        on RNS.PeriodNumber = case 
+                when TA.Period = 'TG' then 1
+                else TA.Period + 1 
+            end
+        and RNS.StaffId = TA.ID
+    where 
+        -- Only return records where a notification has not been sent. 
+        LOG.Seq is NULL
+        -- Exclude Junior School for the time being. 
+        and RNS.NormalYearLevel in (
+            select Code
+            from luYearLevel 
+            where Campus = 'WC' 
+                and SubSchool in ('M', 'S'))
+        -- Do not notify absent teachers where no relief has been set. 
+        and (TA.ID is null 
+            or RNS.ReliefTeacherId is not null)
+    order by 
+        COM.OccupEmail, RNS.ClassCode, RNS.PeriodNumber
+
+    RETURN
+end 
+GO
+
+
