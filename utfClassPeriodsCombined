@@ -1,0 +1,143 @@
+
+CREATE function [woodcroft].[utfClassPeriodsCombined] (
+    @Date Date)
+returns @ClassPeriods table (
+    ClassCode       varchar(200),
+    PeriodStart     int,
+    PeriodEnd       int,
+    LessonStart     varchar(200),
+    LessonEnd       varchar(200),
+    DateTimeFrom    DateTime,
+    DateTimeTo      Datetime)
+as begin 
+
+    /* 
+    AUTHOR: Benjamin Selby
+    DATE: June 2022
+
+    Outputs a list of the classes on a particular date, combined so that multi-period classes 
+    are presented in the same row, with start & finish periods reflecting the first and last 
+    periods of their span. This is important in some cases because we want to determine when a 
+    multi-period class finishes, rather than simply the first period of a multi-period class. 
+
+    */
+
+
+    /* ========================================================================== */
+    /* INIT. */
+    /* ========================================================================== */
+
+    set @Date                   = isnull(@Date, cast(getdate() as Date))
+    declare @Year       INT     = year(@Date)
+    declare @Semester   INT     = case when month(@Date) <= 6 then 1 else 2 end
+    declare @DayNumber  INT     = DATEPART(weekday, @Date) - 1
+
+
+    /* ========================================================================== */
+    /* 
+    IDENTIFY MULTI-PERIOD CLASSES
+
+    Identifiying multi-period classes is more complex than it seems. We want to be able to 
+    identify any class for a given day which runs across more than one period CONTIGUOUSLY. 
+    Be aware that some classes may occur for multiple periods in a day non-contiguously! 
+    e.g. Tutor Group in the morning, and Pastoral Care in the afternoon. 
+
+    We identify contiguous classes by calculating LAG values for sorted class periods. 
+
+        When (Period - LAG(Period)) = 1, then the previous class period was contiguous. 
+        When (Period - LAG(Period)) > 1, then the previous class occurred earlier in the day.
+
+    Example: 
+        Maths (Period 7) - Maths(Period 6) = 1, so classes were contiguous. 
+        English (Period 7) - English(Period 4) = 3, so not contiguous. 
+
+    We then select MIN and MAX periods for the start and end periods for a multi-period class (because 
+    there may be more than two contiguous periods). 
+
+    In order to obtain a list of only single-period classes, we join on the multi-period classes 
+    and select only classes which did not occur between the multi-period class periods. We do this 
+    because a class may have a multi-period session as well as a single period session non-contiguously. 
+    (This does actually happen in a single day, e.g. study, pastoral care/tutor group). 
+    */
+    
+    /* ========================================================================== */
+
+    ; with MyClassPeriodLags as (
+        select 
+            TT.DayNumber, 
+            TT.PeriodNumber,
+            TT.ClassCode,
+            -- Multi-period classes will have a NON-NULL value >= 1 here. 
+            PeriodNumber - LAG(TT.PeriodNumber) over (
+                partition by ClassCode 
+                order by PeriodNumber) as PeriodLag
+        from Timetable as TT
+        where TT.FileYear = @Year
+            and TT.FileSemester = @Semester
+            and TT.DayNumber = @DayNumber
+    )
+
+
+    /* Some classes may span more than a single contiguous period, so here we get 
+    the first and last period for all classes which span more than one period
+    successively (Min(PeriodNumber) <> Max(PeriodNumber)). */
+    , MyMultiPeriodClasses as (
+        select 
+            ClassCode, 
+            MIN(PeriodNumber) as PeriodStart,
+            MAX(PeriodNumber) as PeriodEnd
+        from MyClassPeriodLags as CPL
+        where PeriodLag is NULL or PeriodLag = 1
+        group by ClassCode
+        having MIN(PeriodNumber) <> MAX(PeriodNumber) 
+    )
+
+    , MyAllClassPeriods as (
+        select 
+            MPC.*
+        from MyMultiPeriodClasses as MPC
+
+        union 
+
+        -- Single-period classes. 
+        select 
+            CPL.ClassCode,
+            CPL.PeriodNumber as PeriodStart,
+            CPL.PeriodNumber as PeriodEnd
+        from MyClassPeriodLags as CPL
+        left join MyMultiPeriodClasses as MPC
+            on CPL.ClassCode = MPC.ClassCode
+            and CPL.PeriodNumber between MPC.PeriodStart and MPC.PeriodEnd
+        where MPC.ClassCode is NULL
+    )
+
+    insert into @ClassPeriods
+    select 
+        ACP.ClassCode,
+        ACP.PeriodStart,
+        ACP.PeriodEnd,
+        TTD_Start.Description as LessonStart,
+        TTD_End.Description as LessonEnd,
+        dateadd(Minute, 
+            datediff(minute, '1900-01-01', Cast(TTD_Start.TimeFrom as Time)), 
+            Cast(@Date as Datetime)) as DateTimeFrom,
+        dateadd(Minute, 
+            datediff(minute, '1900-01-01', Cast(TTD_End.TimeTo as Time)), 
+            Cast(@Date as Datetime)) as DateTimeTo
+    from MyAllClassPeriods as ACP
+    left join dbo.TimetableDefinition as TTD_Start
+        on @Year = TTD_Start.FileYear
+        and @Semester = TTD_Start.FileSemester 
+        and TTD_Start.DayNumber = 0
+        and ACP.PeriodStart = TTD_Start.PeriodNumber
+        and TTD_Start.AttendanceEntryEnabledFlag = 1
+    left join dbo.TimetableDefinition as TTD_End
+        on @Year = TTD_End.FileYear
+        and @Semester = TTD_End.FileSemester 
+        and TTD_End.DayNumber = 0
+        and ACP.PeriodEnd = TTD_End.PeriodNumber
+        and TTD_End.AttendanceEntryEnabledFlag = 1
+
+    return
+end
+GO
