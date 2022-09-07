@@ -1,0 +1,245 @@
+CREATE function [woodcroft].[utfClassRollsMissing] (
+    @DateTime           DateTime,
+    @DelayMinutes       INT = 15)
+returns @MissingClassRolls table (
+    DayNumber           int, 
+    PeriodNumber        int,
+    Lesson              varchar(100),
+    ClassCode           varchar(100),
+    TimeFrom            Time, 
+    TimeTo              Time,
+    Description         varchar(500),
+    NormalYearLevel     int,
+    StaffID             int,
+    ReliefTeacherId     int)
+as begin 
+
+    /* 
+    AUTHOR: Benjamin Selby
+    DATE: June 2022
+
+    Outputs a list of the classes which have finished so far today (with a time offset 
+    parameter to allow staff some time after a class has ended to fill in their rolls) 
+    where a roll has NOT been submitted yet (ie. teacher has not done a class roll 
+    as expected). 
+
+    One complexity is that we need to wait until multi-period classes have finished 
+    before sending notifications (we don't want to send a notification after the first 
+    period of a multi-period class has ended, but while the second period is in progress). 
+    So, we must first identify multi-period classes and only notify when class rolls are 
+    missing after the final period has ended. 
+
+    Excludes any classes where all students are absent (e.g. on camp), although 
+    technically staff should still be completing rolls for those classes. 
+
+    MODIFICATIONS ================================================================
+
+    [2022/08/03 SELBY_B] Removed code which determined which classes have finished 
+        before the cutoff time, replaced with a function call to 
+        [woodcroft].[utfClassPeriodsCombined]. That function incorporates the 
+        logic required to determine start/finish times of multi-period classes. 
+            
+    [2022.08.19 selby_b] Added code which merges on the Daily Organiser cancelled 
+        classes table and excludes them from output, so we don't mail out reminders
+        to staff when a class has been cancelled.
+    */
+
+
+    /* ========================================================================== */
+    /* INIT. */
+    /* ========================================================================== */
+
+    set @DateTime       = isnull(@DateTime, getdate())
+    declare @Date       Date = cast(@DateTime as Date)
+    declare @Time       Time = cast(@DateTime as Time)
+    declare @Year       INT = year(@Date)
+    declare @Semester   INT = case when month(@Date) <= 6 then 1 else 2 end
+    declare @DayNumber  INT = DATEPART(weekday, @Date) - 1
+
+    
+    /* ========================================================================== */
+    /* Get all classes scheduled for today with at least one student who is not 
+    absent from school. Although technically teachers should do rolls for classes 
+    where all students are absent, we have decided to ignore these for now. */
+    /* ========================================================================== */
+
+
+    declare @StudentAbsences table (
+        DayNumber               int, 
+        PeriodNumber            int, 
+        ClassCode               varchar(200), 
+        Room                    varchar(100),
+        ClassStartTime          time, 
+        ClassEndTime            time, 
+        AbsenceEventTypeCode    varchar(200),
+        AbsenceReasonCode       varchar(100),
+        EventComment            varchar(500),
+        AbsenceEventTime        time,
+        SchoolInOutStatus       varchar(10))
+
+    insert into @StudentAbsences
+    select distinct 
+        TT.DayNumber, 
+        TT.PeriodNumber, 
+        TT.ClassCode, 
+        TT.Room,
+        cast(TTD.TimeFrom as Time) as ClassStartTime, 
+        cast(TTD.TimeTo as Time) as ClassEndTime, 
+        AE.AbsenceEventTypeCode,
+        AE.AbsenceReasonCode,
+        AE.EventComment,
+        AE.EventTime,
+        AE.SchoolInOutStatus
+    from StudentClasses as STC
+    -- INNER JOIN to remove any classes not scheduled for today. 
+    INNER JOIN Timetable as TT
+        on TT.FileYear = @Year
+        and TT.FileSemester = @Semester
+        and TT.DayNumber = @DayNumber
+        and STC.ClassCode = TT.ClassCode
+    left join TimetableDefinition as TTD
+        on TTD.FileYear = @Year
+        and TTD.FileSemester = @Semester
+        and TTD.DayNumber = 0
+        and TT.PeriodNumber = TTD.PeriodNumber
+    left join AbsenceEvents as AE
+        on @Date = AE.EventDate 
+        and STC.ID = AE.ID
+        and SupersededByAbsenceEventsSeq is NULL
+    where STC.FileYear = @Year
+        and STC.FileSemester = @Semester
+        and (STC.StopDate is NULL
+            or STC.StopDate > @DateTime)
+
+
+    delete from @StudentAbsences
+    where AbsenceEventTypeCode = 'AllDayAbsence'
+        -- Exclude students expected to leave or who have left before a class finishes. 
+        or (AbsenceEventTypeCode = 'ExcursionOutIn'
+            and SchoolInOutStatus = 'Out'
+            and AbsenceEventTime <= ClassEndTime)
+        or (AbsenceEventTypeCode in ('ExpectedOut', 'SignOut')
+            and AbsenceEventTime <= ClassEndTime)
+        -- Exclude students expected to arrive or who have arrived after a class starts. 
+        or (AbsenceEventTypeCode = 'ExcursionOutIn'
+            and SchoolInOutStatus = 'In'
+            and ClassStartTime <= AbsenceEventTime)
+        or (AbsenceEventTypeCode in ('ExpectedIn', 'SignIn')
+            and ClassStartTime <= AbsenceEventTime)
+
+
+    declare @ClassesWithStudentsPresent table (
+        DayNumber       INT,
+        PeriodNumber    INT,
+        ClassCode       VARCHAR(200))
+
+    insert into @ClassesWithStudentsPresent
+    select distinct 
+        DayNumber,
+        PeriodNumber,
+        ClassCode 
+    from @StudentAbsences
+
+
+    /* ==================================================================================== */
+    /* FINAL OUTPUT. */
+    /* ==================================================================================== */
+
+    ;
+    with MyReliefStaff as (
+        select 
+            RLF.*,
+            ISNULL(TCH.ID, EMG.ID) as ReliefTeacherId
+        from dailyOrganiser.uReliefs as RLF
+        left join dailyOrganiser.uTeachers as TCH
+            on RLF.ReliefTeacherCode = TCH.Code
+        left join dailyOrganiser.uEmergencyTeachers as EMG
+            on RLF.ReliefTeacherCode = EMG.Code
+        where @Date = RLF.ReliefDate
+    )
+    
+    , CancelledClasses as (
+
+        select distinct 
+            Date, 
+            Period, 
+            ClassCode
+        from dailyOrganiser.uLessonCancellations
+        where Date = @Date
+    )
+
+
+    insert into @MissingClassRolls (
+        DayNumber,
+        PeriodNumber,
+        Lesson,
+        ClassCode,
+        TimeFrom,
+        TimeTo,
+        Description,
+        NormalYearLevel,
+        StaffID,
+        ReliefTeacherId)
+    select
+        TT.DayNumber, 
+        TT.PeriodNumber,
+        TTD.Description as Lesson,
+        TT.ClassCode, 
+        cast(TTD.TimeFrom as Time) as TimeFrom, 
+        cast(TTD.TimeTo as Time) as TimeTo,
+        SUC.Description,
+        SUC.NormalYearLevel,
+        TT.StaffID,
+        RLF.ReliefTeacherId
+    from Timetable as TT
+    left join dbo.TimetableDefinition as TTD
+        on @Year = TTD.FileYear
+        and @Semester = TTD.FileSemester 
+        -- TimetableDefinition only uses day number of zero. 
+        and TTD.DayNumber = 0
+        and TT.PeriodNumber = TTD.PeriodNumber
+        and TTD.AttendanceEntryEnabledFlag = 1
+    left join dbo.SubjectClasses as SUC
+        on @Year = SUC.FileYear 
+        and @Semester = SUC.FileSemester
+        and TT.ClassCode = SUC.ClassCode
+    left join AttendanceMaster as AM
+        on @Date = AM.AttendanceDate
+        and @DayNumber = AM.AttendanceDayNumber
+        and TT.PeriodNumber = AM.AttendancePeriod
+        and TT.ClassCode = AM.ClassCode
+    left join MyReliefStaff as RLF
+        on TT.ClassCode = RLF.ClassCode
+        and TT.PeriodNumber = case 
+            when RLF.Period = 'TG' then 1
+            else RLF.Period + 1
+        end         
+    -- Remove any classes with no students present. 
+    INNER JOIN (
+        select distinct ClassCode 
+        from @ClassesWithStudentsPresent) AS CSP(ClassCode)
+        on TT.ClassCode = CSP.ClassCode
+    -- Only keep classes which have finished before cutoff time.
+    INNER join woodcroft.utfClassPeriodsCombined(@Date) as CP
+        on TT.ClassCode = CP.ClassCode
+        and TT.PeriodNumber between CP.PeriodStart and CP.PeriodEnd
+        and CP.DateTimeTo <= dateadd(Minute, -@DelayMinutes, @DateTime) 
+    left join CancelledClasses as CC
+        on TT.ClassCode = CC.ClassCode
+        and TT.PeriodNumber = case 
+            when CC.Period = 'TG' then 1
+            else CC.Period + 1 end
+    where TT.FileYear = @Year
+        and TT.FileSemester = @Semester
+        and TT.DayNumber = @DayNumber
+        and TT.StaffID is not NULL 
+        and TT.StaffID <> 0
+        and AM.AttendanceMasterSeq is NULL
+        and CC.ClassCode is NULL
+    order by TT.ClassCode, TT.PeriodNumber
+                     
+    return 
+end
+GO
+
+
